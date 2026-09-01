@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <base target="_top">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta charset="UTF-8">
+  <title>工作室財務健康 APP</title>
+  <style>
+    :root{--bg:#f5f7fb;--card:#fff;--text:#172033;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--good:#0f9d58;--warn:#d97706;--bad:#dc2626}
+    *{box-sizing:border-box} body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans TC",sans-serif;background:var(--bg);color:var(--text)}
+    .app{max-width:1180px;margin:auto;padding:16px 16px 90px}.topbar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}.title{font-size:24px;font-weight:800}.subtitle{color:var(--muted);font-size:13px}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:0 5px 18px rgba(15,23,42,.04)}
+    .metric .label{font-size:13px;color:var(--muted)}.metric .value{font-size:28px;font-weight:800;margin-top:6px}.metric .hint{font-size:12px;color:var(--muted);margin-top:6px}.health{font-weight:800}.green{color:var(--good)}.yellow{color:var(--warn)}.red{color:var(--bad)}
+    .section{margin-top:16px}.section h2{font-size:17px;margin:0 0 10px}.bizgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}.biz .name{font-weight:700}.biz .nums{display:flex;justify-content:space-between;margin-top:10px;font-size:13px;color:var(--muted)}
+    button{border:0;border-radius:12px;padding:11px 14px;font-weight:700;cursor:pointer}.primary{background:var(--accent);color:#fff}.ghost{background:#eef2ff;color:#1e3a8a}.danger{background:#fee2e2;color:#991b1b}.fab{position:fixed;right:20px;bottom:24px;border-radius:999px;padding:16px 20px;background:var(--accent);color:#fff;box-shadow:0 10px 30px rgba(37,99,235,.35);font-size:16px}
+    .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.tab{background:#fff;border:1px solid var(--line);color:var(--text)}.tab.active{background:#172033;color:#fff}.page{display:none}.page.active{display:block}
+    .formgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.field{display:flex;flex-direction:column;gap:6px}.field label{font-size:13px;color:var(--muted)} input,select,textarea{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:12px;background:#fff;font:inherit}textarea{min-height:82px;resize:vertical}.full{grid-column:1/-1}.radioRow{display:flex;gap:8px}.radioBtn{flex:1;background:#f3f4f6}.radioBtn.active{background:#172033;color:#fff}
+    table{width:100%;border-collapse:collapse;font-size:13px}.tableWrap{overflow:auto;background:#fff;border:1px solid var(--line);border-radius:16px}th,td{padding:11px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}th{background:#f8fafc;position:sticky;top:0}.plus{color:var(--good);font-weight:700}.minus{color:var(--bad);font-weight:700}.empty{padding:28px;text-align:center;color:var(--muted)}
+    .settingsGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.toast{position:fixed;left:50%;bottom:90px;transform:translateX(-50%);background:#111827;color:#fff;padding:10px 16px;border-radius:999px;display:none;z-index:20}.loading{opacity:.55;pointer-events:none}
+    @media(max-width:820px){.grid{grid-template-columns:repeat(2,1fr)}.bizgrid{grid-template-columns:1fr 1fr}.settingsGrid{grid-template-columns:1fr}.formgrid{grid-template-columns:1fr}.full{grid-column:auto}.title{font-size:20px}}
+    @media(max-width:520px){.app{padding:12px 12px 92px}.grid{gap:8px}.card{padding:13px;border-radius:15px}.metric .value{font-size:22px}.bizgrid{grid-template-columns:1fr}.topbar{align-items:flex-start;flex-direction:column}.tabs{overflow:auto;flex-wrap:nowrap;padding-bottom:4px}.tab{white-space:nowrap}.fab{right:14px;bottom:18px}}
+  </style>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="topbar"><div><div class="title">工作室財務健康 APP</div><div class="subtitle" id="monthText">載入中...</div></div><button class="ghost" onclick="refreshAll()">重新整理</button></div>
+  <div class="tabs">
+    <button class="tab active" data-page="dashboard">儀表板</button><button class="tab" data-page="entry">快速記帳</button><button class="tab" data-page="ledger">帳本</button><button class="tab" data-page="settings">設定</button>
+  </div>
+
+  <section id="dashboard" class="page active">
+    <div class="grid">
+      <div class="card metric"><div class="label">本月營收</div><div class="value" id="mRevenue">$0</div></div>
+      <div class="card metric"><div class="label">本月直接支出</div><div class="value" id="mExpense">$0</div></div>
+      <div class="card metric"><div class="label">本月淨利</div><div class="value" id="mProfit">$0</div></div>
+      <div class="card metric"><div class="label">固定成本</div><div class="value" id="mFixed">$0</div></div>
+      <div class="card metric"><div class="label">工作室現金</div><div class="value" id="mCash">$0</div><div class="hint">由設定頁更新</div></div>
+      <div class="card metric"><div class="label">損益兩平營收</div><div class="value" id="mBreakEven">$0</div></div>
+      <div class="card metric"><div class="label">現金續航</div><div class="value" id="mRunway">0 月</div></div>
+      <div class="card metric"><div class="label">財務健康</div><div class="value health" id="mHealth">—</div></div>
+    </div>
+    <div class="section"><h2>五大業務表現</h2><div class="bizgrid" id="bizGrid"></div></div>
+  </section>
+
+  <section id="entry" class="page">
+    <div class="card">
+      <h2 style="margin-top:0">新增一筆帳</h2>
+      <div class="formgrid">
+        <div class="field full"><label>收入 / 支出</label><div class="radioRow"><button type="button" id="incomeBtn" class="radioBtn active" onclick="setType('收入')">收入</button><button type="button" id="expenseBtn" class="radioBtn" onclick="setType('支出')">支出</button></div></div>
+        <div class="field"><label>日期</label><input id="date" type="date"></div>
+        <div class="field"><label>金額</label><input id="amount" type="number" inputmode="decimal" min="1" placeholder="例如 30000"></div>
+        <div class="field"><label>業務類型</label><select id="businessType" onchange="renderCategoryOptions()"></select></div>
+        <div class="field"><label>分類</label><select id="category"></select></div>
+        <div class="field"><label>客戶</label><input id="customer" placeholder="可空白"></div>
+        <div class="field"><label>說明</label><input id="description" placeholder="例如：企業 AI 課程"></div>
+        <div class="field"><label>帳戶</label><select id="account"></select></div>
+        <div class="field"><label>付款方式</label><select id="paymentMethod"><option>轉帳</option><option>現金</option><option>信用卡</option><option>其他</option></select></div>
+        <div class="field"><label>付款狀態</label><select id="paymentStatus"><option>已收/付</option><option>未收/付</option></select></div>
+        <div class="field"><label>專案 ID</label><input id="projectId" placeholder="可空白"></div>
+        <div class="field full"><label>備註</label><textarea id="note" placeholder="其他補充"></textarea></div>
+        <div class="full"><button class="primary" style="width:100%" onclick="saveTransaction()">儲存這筆帳</button></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="ledger" class="page">
+    <div class="tableWrap"><table><thead><tr><th>日期</th><th>業務</th><th>分類</th><th>客戶 / 說明</th><th>收支</th><th>金額</th><th>帳戶</th></tr></thead><tbody id="ledgerBody"></tbody></table></div>
+  </section>
+
+  <section id="settings" class="page">
+    <div class="settingsGrid">
+      <div class="card"><h2 style="margin-top:0">財務設定</h2><div class="field"><label>目前工作室可動用現金</label><input id="cashBalance" type="number"></div><div class="field" style="margin-top:10px"><label>老闆月薪目標</label><input id="ownerSalary" type="number"></div><button class="primary" style="margin-top:12px;width:100%" onclick="saveSettings()">儲存設定</button></div>
+      <div class="card"><h2 style="margin-top:0">固定成本</h2><div id="fixedList" class="subtitle"></div></div>
+      <div class="card"><h2 style="margin-top:0">新增固定成本</h2><div class="field"><label>項目</label><input id="fixedItem"></div><div class="field" style="margin-top:8px"><label>每月金額</label><input id="fixedAmount" type="number"></div><div class="field" style="margin-top:8px"><label>分類</label><input id="fixedCategory" value="其他"></div><button class="primary" style="margin-top:12px;width:100%" onclick="addFixedCost()">新增</button></div>
+    </div>
+  </section>
+</div>
+<button class="fab" onclick="showPage('entry')">＋ 記一筆</button><div class="toast" id="toast"></div>
+<script>
+let state={type:'收入',categories:[],accounts:[],fixedCosts:[],dashboard:null,recentTransactions:[],businessTypes:[]};
+const $=id=>document.getElementById(id); const money=n=>'$'+Math.round(Number(n||0)).toLocaleString('zh-TW');
+function init(){ $('date').value=new Date().toISOString().slice(0,10); bindTabs(); refreshAll(); }
+function bindTabs(){ document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>showPage(b.dataset.page))); }
+function showPage(id){ document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id===id)); document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.page===id)); if(id==='entry') setTimeout(()=>$('amount').focus(),50); }
+function setLoading(on){ $('app').classList.toggle('loading',on); }
+function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none',1800); }
+function callServer(method,...args){ return new Promise((resolve,reject)=>{ const runner=google.script.run.withSuccessHandler(resolve).withFailureHandler(e=>reject(new Error(e.message||e))); if(method==='getBootstrapData') runner.getBootstrapData(); else if(method==='addTransaction') runner.addTransaction(...args); else if(method==='saveSettings') runner.saveSettings(...args); else if(method==='addFixedCost') runner.addFixedCost(...args); else reject(new Error('未知的伺服器方法')); }); }
+async function refreshAll(){ try{setLoading(true); const data=await callServer('getBootstrapData'); Object.assign(state,data); hydrateSelectors(); renderAll();}catch(e){alert(e.message)}finally{setLoading(false);} }
+function hydrateSelectors(){ $('businessType').innerHTML=state.businessTypes.map(x=>`<option>${x}</option>`).join(''); $('account').innerHTML=state.accounts.map(x=>`<option>${x.name}</option>`).join(''); renderCategoryOptions(); }
+function setType(t){ state.type=t; $('incomeBtn').classList.toggle('active',t==='收入'); $('expenseBtn').classList.toggle('active',t==='支出'); renderCategoryOptions(); }
+function renderCategoryOptions(){ const biz=$('businessType').value; const list=state.categories.filter(x=>x.type===state.type && (x.businessType===biz || x.businessType==='工作室共用')); $('category').innerHTML=list.map(x=>`<option>${x.name}</option>`).join('') || '<option>其他</option>'; }
+function renderAll(){ renderDashboard(); renderLedger(); renderFixedCosts(); }
+function renderDashboard(){ const d=state.dashboard||{}; $('monthText').textContent=(d.month||'')+' 財務概況'; $('mRevenue').textContent=money(d.revenue); $('mExpense').textContent=money(d.expenses); $('mProfit').textContent=money(d.netProfit); $('mFixed').textContent=money(d.fixedCosts); $('mCash').textContent=money(d.cashBalance); $('mBreakEven').textContent=money(d.breakevenRevenue); $('mRunway').textContent=(Number(d.runwayMonths||0)).toFixed(1)+' 月'; $('mHealth').textContent=d.health||'—'; $('mHealth').className='value health '+(d.health==='綠燈'?'green':d.health==='黃燈'?'yellow':'red'); $('ownerSalary').value=d.ownerSalary||0; $('cashBalance').value=d.cashBalance||0;
+  const entries=Object.entries(d.byBusiness||{}).filter(([k])=>k!=='工作室共用'); $('bizGrid').innerHTML=entries.map(([k,b])=>`<div class="card biz"><div class="name">${k}</div><div class="nums"><span>營收 ${money(b.revenue)}</span><span>支出 ${money(b.expense)}</span></div><div class="nums"><strong>損益 ${money(b.profit)}</strong><span>毛利率 ${Number(b.margin||0).toFixed(1)}%</span></div></div>`).join(''); }
+function renderLedger(){ const rows=state.recentTransactions||[]; $('ledgerBody').innerHTML=rows.length?rows.map(x=>`<tr><td>${x.date}</td><td>${x.businessType}</td><td>${x.category}</td><td>${x.customer||x.description||'-'}</td><td>${x.type}</td><td class="${x.type==='收入'?'plus':'minus'}">${x.type==='收入'?'+':'-'}${money(x.amount)}</td><td>${x.account||'-'}</td></tr>`).join(''):`<tr><td colspan="7" class="empty">還沒有帳目，先新增第一筆吧。</td></tr>`; }
+function renderFixedCosts(){ const list=state.fixedCosts||[]; $('fixedList').innerHTML=list.map(x=>`<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #eee"><span>${x.item}</span><strong>${money(x.amount)}</strong></div>`).join('')+`<div style="display:flex;justify-content:space-between;padding-top:10px"><span>合計</span><strong>${money(list.reduce((s,x)=>s+x.amount,0))}</strong></div>`; }
+async function saveTransaction(){ const data={date:$('date').value,type:state.type,businessType:$('businessType').value,category:$('category').value,customer:$('customer').value,description:$('description').value,amount:Number($('amount').value),account:$('account').value,paymentMethod:$('paymentMethod').value,paymentStatus:$('paymentStatus').value,projectId:$('projectId').value,note:$('note').value}; if(!data.date||!data.amount){toast('請填日期與金額');return;} try{setLoading(true); const res=await callServer('addTransaction',data); state.dashboard=res.dashboard; state.recentTransactions=res.recentTransactions; renderAll(); ['amount','customer','description','projectId','note'].forEach(id=>$(id).value=''); toast('已儲存'); showPage('dashboard');}catch(e){alert(e.message)}finally{setLoading(false);} }
+async function saveSettings(){ try{setLoading(true); const res=await callServer('saveSettings',{CASH_BALANCE:Number($('cashBalance').value||0),OWNER_SALARY_TARGET:Number($('ownerSalary').value||0)}); state.dashboard=res.dashboard; renderDashboard(); toast('設定已儲存');}catch(e){alert(e.message)}finally{setLoading(false);} }
+async function addFixedCost(){ const data={item:$('fixedItem').value,amount:Number($('fixedAmount').value),category:$('fixedCategory').value}; if(!data.item||!data.amount){toast('請填項目與金額');return;} try{setLoading(true); const res=await callServer('addFixedCost',data); state.fixedCosts=res.fixedCosts; state.dashboard=res.dashboard; renderAll(); $('fixedItem').value='';$('fixedAmount').value=''; toast('固定成本已新增');}catch(e){alert(e.message)}finally{setLoading(false);} }
+window.addEventListener('load',init);
+</script>
+</body>
+</html>
