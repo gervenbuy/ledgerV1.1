@@ -78,12 +78,13 @@
 <script>
 let state={type:'收入',categories:[],accounts:[],fixedCosts:[],dashboard:null,recentTransactions:[],businessTypes:[]};
 const $=id=>document.getElementById(id); const money=n=>'$'+Math.round(Number(n||0)).toLocaleString('zh-TW');
-function init(){ $('date').value=new Date().toISOString().slice(0,10); bindTabs(); refreshAll(); }
+const todayStr=()=>{ const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
+function init(){ $('date').value=todayStr(); bindTabs(); refreshAll(); }
 function bindTabs(){ document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>showPage(b.dataset.page))); }
 function showPage(id){ document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id===id)); document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.page===id)); if(id==='entry') setTimeout(()=>$('amount').focus(),50); }
 function setLoading(on){ $('app').classList.toggle('loading',on); }
 function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none',1800); }
-function callServer(method,...args){ return new Promise((resolve,reject)=>{ const runner=google.script.run.withSuccessHandler(resolve).withFailureHandler(e=>reject(new Error(e.message||e))); if(method==='getBootstrapData') runner.getBootstrapData(); else if(method==='addTransaction') runner.addTransaction(...args); else if(method==='saveSettings') runner.saveSettings(...args); else if(method==='addFixedCost') runner.addFixedCost(...args); else reject(new Error('未知的伺服器方法')); }); }
+function callServer(method,...args){ return new Promise((resolve,reject)=>{ const runner=google.script.run.withSuccessHandler(resolve).withFailureHandler(e=>reject(new Error(e.message||e))); const fn=runner[method]; if(typeof fn!=='function'){ reject(new Error('未知的伺服器方法：'+method)); return; } fn.apply(runner,args); }); }
 async function refreshAll(){ try{setLoading(true); const data=await callServer('getBootstrapData'); Object.assign(state,data); hydrateSelectors(); renderAll();}catch(e){alert(e.message)}finally{setLoading(false);} }
 function hydrateSelectors(){ $('businessType').innerHTML=state.businessTypes.map(x=>`<option>${x}</option>`).join(''); $('account').innerHTML=state.accounts.map(x=>`<option>${x.name}</option>`).join(''); renderCategoryOptions(); }
 function setType(t){ state.type=t; $('incomeBtn').classList.toggle('active',t==='收入'); $('expenseBtn').classList.toggle('active',t==='支出'); renderCategoryOptions(); }

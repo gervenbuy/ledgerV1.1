@@ -1,3 +1,7 @@
+/**
+ * 工作室財務健康 APP - 後端
+ * V1.2 效能優化 + 備份機制
+ */
 const CONFIG = {
   SPREADSHEET_ID: '1OeJy1bhmGVMXdbbNx-l7ID5tTVJS1FCJxPNSbNJzjEU',
   SHEETS: {
@@ -7,40 +11,113 @@ const CONFIG = {
     ACCOUNTS: 'Accounts',
     FIXED_COSTS: 'FixedCosts',
     SETTINGS: 'Settings'
-  }
+  },
+  CACHE_SECONDS: 300,
+  SETUP_VERSION: 'v1'
 };
 
+const BUSINESS_TYPES = ['AI課程', '接案', '電動車', '設計製作', '顧問', '工作室共用'];
+
+const TX_HEADERS = ['ID', '日期', '收入/支出', '業務類型', '分類', '專案ID', '客戶', '說明', '金額', '付款方式', '帳戶', '付款狀態', '備註', '建立時間'];
+
+/* ===================================================================
+ * 單次執行的快取層
+ * Apps Script 每個請求都是全新的執行環境，所以這些變數等於
+ * 「這一次請求內共用」。原本 openById 會被呼叫 8 次，現在只有 1 次。
+ * =================================================================== */
+let SS_ = null;
+let TX_ROWS_ = null;
+let TZ_ = null;
+
+function getSpreadsheet_() {
+  if (SS_) return SS_;
+  if (!CONFIG.SPREADSHEET_ID || CONFIG.SPREADSHEET_ID.indexOf('PUT_YOUR') >= 0) {
+    throw new Error('請先在 Code.gs 的 CONFIG.SPREADSHEET_ID 貼上你的 Google Sheet ID。');
+  }
+  SS_ = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+  return SS_;
+}
+
+function getSheet_(name) {
+  const sh = getSpreadsheet_().getSheetByName(name);
+  if (!sh) throw new Error('找不到工作表：' + name + '（請手動執行一次 setupSpreadsheet）');
+  return sh;
+}
+
+function getTz_() {
+  if (!TZ_) TZ_ = Session.getScriptTimeZone() || 'Asia/Taipei';
+  return TZ_;
+}
+
+/** Transactions 整張表在一次請求內只讀一次，儀表板與帳本共用。 */
+function getTransactionRows_() {
+  if (TX_ROWS_) return TX_ROWS_;
+  TX_ROWS_ = getRows_(getSheet_(CONFIG.SHEETS.TRANSACTIONS));
+  return TX_ROWS_;
+}
+
+/* ===================================================================
+ * 跨請求快取：分類 / 帳戶 / 固定成本 / 設定很少變動
+ * =================================================================== */
+function cacheGet_(key, producer) {
+  const cache = CacheService.getScriptCache();
+  const hit = cache.get(key);
+  if (hit) {
+    try {
+      return JSON.parse(hit);
+    } catch (e) {
+      // 快取內容壞掉就重算
+    }
+  }
+  const value = producer();
+  try {
+    cache.put(key, JSON.stringify(value), CONFIG.CACHE_SECONDS);
+  } catch (e) {
+    // 超過快取大小上限就跳過，不影響功能
+  }
+  return value;
+}
+
+function cacheClear_() {
+  CacheService.getScriptCache().removeAll(['cat', 'acc', 'fixed', 'settings']);
+}
+
+/* ===================================================================
+ * 入口
+ * =================================================================== */
 function doGet() {
   return HtmlService.createTemplateFromFile('Index')
     .evaluate()
     .setTitle('工作室財務健康 APP')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover')
     .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
 }
 
-function getSpreadsheet_() {
-  if (!CONFIG.SPREADSHEET_ID || CONFIG.SPREADSHEET_ID.includes('PUT_YOUR')) {
-    throw new Error('請先在 Code.gs 的 CONFIG.SPREADSHEET_ID 貼上你的 Google Sheet ID。');
-  }
-  return SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
+/**
+ * 只在第一次（或換版本）時建表。
+ * 原本每次開 APP 都跑 setupSpreadsheet()，等於白做 20 次以上的 Sheet 操作。
+ */
+function ensureReady_() {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('SETUP_DONE') === CONFIG.SETUP_VERSION) return;
+  setupSpreadsheet();
 }
 
 function setupSpreadsheet() {
   const ss = getSpreadsheet_();
 
-  ensureSheet_(ss, CONFIG.SHEETS.TRANSACTIONS, [
-    'ID','日期','收入/支出','業務類型','分類','專案ID','客戶','說明','金額','付款方式','帳戶','付款狀態','備註','建立時間'
-  ]);
-
+  ensureSheet_(ss, CONFIG.SHEETS.TRANSACTIONS, TX_HEADERS);
   ensureSheet_(ss, CONFIG.SHEETS.PROJECTS, [
-    '專案ID','專案名稱','客戶','業務類型','開始日期','結束日期','報價','狀態','備註'
+    '專案ID', '專案名稱', '客戶', '業務類型', '開始日期', '結束日期', '報價', '狀態', '備註'
   ]);
-
-  ensureSheet_(ss, CONFIG.SHEETS.CATEGORIES, ['類型','分類名稱','業務類型','啟用']);
-  ensureSheet_(ss, CONFIG.SHEETS.ACCOUNTS, ['帳戶名稱','帳戶類型','期初餘額','啟用']);
-  ensureSheet_(ss, CONFIG.SHEETS.FIXED_COSTS, ['項目','每月金額','分類','啟用','備註']);
-  ensureSheet_(ss, CONFIG.SHEETS.SETTINGS, ['設定鍵','設定值','說明']);
+  ensureSheet_(ss, CONFIG.SHEETS.CATEGORIES, ['類型', '分類名稱', '業務類型', '啟用']);
+  ensureSheet_(ss, CONFIG.SHEETS.ACCOUNTS, ['帳戶名稱', '帳戶類型', '期初餘額', '啟用']);
+  ensureSheet_(ss, CONFIG.SHEETS.FIXED_COSTS, ['項目', '每月金額', '分類', '啟用', '備註']);
+  ensureSheet_(ss, CONFIG.SHEETS.SETTINGS, ['設定鍵', '設定值', '說明']);
 
   seedDefaults_(ss);
+  cacheClear_();
+  PropertiesService.getScriptProperties().setProperty('SETUP_DONE', CONFIG.SETUP_VERSION);
   return { ok: true, message: '資料表初始化完成' };
 }
 
@@ -59,39 +136,42 @@ function seedDefaults_(ss) {
   const cat = ss.getSheetByName(CONFIG.SHEETS.CATEGORIES);
   if (cat.getLastRow() <= 1) {
     const rows = [
-      ['收入','AI課程','AI課程',true],['收入','接案收入','接案',true],['收入','維修收入','電動車',true],['收入','車輛銷售','電動車',true],['收入','設計收入','設計製作',true],['收入','顧問費','顧問',true],
-      ['支出','租金','工作室共用',true],['支出','軟體訂閱','工作室共用',true],['支出','廣告','工作室共用',true],['支出','電話網路','工作室共用',true],['支出','車輛分期','工作室共用',true],
-      ['支出','教材印刷','AI課程',true],['支出','交通','工作室共用',true],['支出','外包','接案',true],['支出','零件','電動車',true],['支出','進貨','電動車',true],['支出','印刷製作','設計製作',true],['支出','其他','工作室共用',true]
+      ['收入', 'AI課程', 'AI課程', true], ['收入', '接案收入', '接案', true], ['收入', '維修收入', '電動車', true], ['收入', '車輛銷售', '電動車', true], ['收入', '設計收入', '設計製作', true], ['收入', '顧問費', '顧問', true],
+      ['支出', '租金', '工作室共用', true], ['支出', '軟體訂閱', '工作室共用', true], ['支出', '廣告', '工作室共用', true], ['支出', '電話網路', '工作室共用', true], ['支出', '車輛分期', '工作室共用', true],
+      ['支出', '教材印刷', 'AI課程', true], ['支出', '交通', '工作室共用', true], ['支出', '外包', '接案', true], ['支出', '零件', '電動車', true], ['支出', '進貨', '電動車', true], ['支出', '印刷製作', '設計製作', true], ['支出', '其他', '工作室共用', true]
     ];
-    cat.getRange(2,1,rows.length,4).setValues(rows);
+    cat.getRange(2, 1, rows.length, 4).setValues(rows);
   }
 
   const accounts = ss.getSheetByName(CONFIG.SHEETS.ACCOUNTS);
   if (accounts.getLastRow() <= 1) {
-    accounts.getRange(2,1,4,4).setValues([
-      ['工作室銀行','銀行',0,true],['現金','現金',0,true],['信用卡','信用卡',0,true],['個人代墊','其他',0,true]
+    accounts.getRange(2, 1, 4, 4).setValues([
+      ['工作室銀行', '銀行', 0, true], ['現金', '現金', 0, true], ['信用卡', '信用卡', 0, true], ['個人代墊', '其他', 0, true]
     ]);
   }
 
   const fixed = ss.getSheetByName(CONFIG.SHEETS.FIXED_COSTS);
   if (fixed.getLastRow() <= 1) {
-    fixed.getRange(2,1,9,5).setValues([
-      ['工作室租金',19000,'租金',true,''],['ChatGPT',650,'軟體訂閱',true,''],['Gemini',650,'軟體訂閱',true,''],['Claude',760,'軟體訂閱',true,'依實際台幣帳單調整'],['Kling',610,'軟體訂閱',true,'依實際台幣帳單調整'],['Google Ads',3000,'廣告',true,''],['Facebook Ads',3000,'廣告',true,''],['電話＋網路',2000,'電話網路',true,''],['貨車分期',4790,'車輛分期',true,'48期']
+    fixed.getRange(2, 1, 9, 5).setValues([
+      ['工作室租金', 19000, '租金', true, ''], ['ChatGPT', 650, '軟體訂閱', true, ''], ['Gemini', 650, '軟體訂閱', true, ''], ['Claude', 760, '軟體訂閱', true, '依實際台幣帳單調整'], ['Kling', 610, '軟體訂閱', true, '依實際台幣帳單調整'], ['Google Ads', 3000, '廣告', true, ''], ['Facebook Ads', 3000, '廣告', true, ''], ['電話＋網路', 2000, '電話網路', true, ''], ['貨車分期', 4790, '車輛分期', true, '48期']
     ]);
   }
 
   const settings = ss.getSheetByName(CONFIG.SHEETS.SETTINGS);
   if (settings.getLastRow() <= 1) {
-    settings.getRange(2,1,4,3).setValues([
-      ['OWNER_SALARY_TARGET',40000,'老闆每月希望領取金額'],['CASH_BALANCE',0,'目前工作室可動用現金'],['SAFE_MONTHS',6,'健康現金續航月份'],['LOW_MONTHS',3,'危險現金續航月份']
+    settings.getRange(2, 1, 4, 3).setValues([
+      ['OWNER_SALARY_TARGET', 40000, '老闆每月希望領取金額'], ['CASH_BALANCE', 0, '目前工作室可動用現金'], ['SAFE_MONTHS', 6, '健康現金續航月份'], ['LOW_MONTHS', 3, '危險現金續航月份']
     ]);
   }
 }
 
+/* ===================================================================
+ * 讀取
+ * =================================================================== */
 function getBootstrapData() {
-  setupSpreadsheet();
+  ensureReady_();
   return {
-    businessTypes: ['AI課程','接案','電動車','設計製作','顧問','工作室共用'],
+    businessTypes: BUSINESS_TYPES,
     categories: getCategories_(),
     accounts: getAccounts_(),
     fixedCosts: getFixedCosts_(),
@@ -101,90 +181,78 @@ function getBootstrapData() {
 }
 
 function getCategories_() {
-  const sh = getSpreadsheet_().getSheetByName(CONFIG.SHEETS.CATEGORIES);
-  const rows = getRows_(sh);
-  return rows.filter(r => asBool_(r[3])).map(r => ({ type:r[0], name:r[1], businessType:r[2] }));
+  return cacheGet_('cat', function () {
+    return getRows_(getSheet_(CONFIG.SHEETS.CATEGORIES))
+      .filter(r => asBool_(r[3]))
+      .map(r => ({ type: r[0], name: r[1], businessType: r[2] }));
+  });
 }
 
 function getAccounts_() {
-  const sh = getSpreadsheet_().getSheetByName(CONFIG.SHEETS.ACCOUNTS);
-  const rows = getRows_(sh);
-  return rows.filter(r => asBool_(r[3])).map(r => ({ name:r[0], type:r[1], openingBalance:Number(r[2]||0) }));
+  return cacheGet_('acc', function () {
+    return getRows_(getSheet_(CONFIG.SHEETS.ACCOUNTS))
+      .filter(r => asBool_(r[3]))
+      .map(r => ({ name: r[0], type: r[1], openingBalance: Number(r[2] || 0) }));
+  });
 }
 
 function getFixedCosts_() {
-  const sh = getSpreadsheet_().getSheetByName(CONFIG.SHEETS.FIXED_COSTS);
-  const rows = getRows_(sh);
-  return rows.filter(r => asBool_(r[3])).map(r => ({ item:r[0], amount:Number(r[1]||0), category:r[2], note:r[4]||'' }));
+  return cacheGet_('fixed', function () {
+    return getRows_(getSheet_(CONFIG.SHEETS.FIXED_COSTS))
+      .filter(r => asBool_(r[3]))
+      .map(r => ({ item: r[0], amount: Number(r[1] || 0), category: r[2], note: r[4] || '' }));
+  });
+}
+
+function getSettingsMap_() {
+  return cacheGet_('settings', function () {
+    const out = {};
+    getRows_(getSheet_(CONFIG.SHEETS.SETTINGS)).forEach(r => out[r[0]] = r[1]);
+    return out;
+  });
 }
 
 function getRows_(sh) {
   const lr = sh.getLastRow();
   const lc = sh.getLastColumn();
   if (lr <= 1 || lc === 0) return [];
-  return sh.getRange(2,1,lr-1,lc).getValues();
+  return sh.getRange(2, 1, lr - 1, lc).getValues();
 }
 
-function addTransaction(data) {
-  validateTransaction_(data);
-  const ss = getSpreadsheet_();
-  const sh = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
-  const id = 'TX-' + Utilities.getUuid().slice(0,8).toUpperCase();
-  const now = new Date();
-  sh.appendRow([
-    id,
-    parseDate_(data.date),
-    data.type,
-    data.businessType,
-    data.category,
-    data.projectId || '',
-    data.customer || '',
-    data.description || '',
-    Number(data.amount),
-    data.paymentMethod || '',
-    data.account || '',
-    data.paymentStatus || '已收/付',
-    data.note || '',
-    now
-  ]);
-  return { ok:true, id:id, dashboard:getDashboard(), recentTransactions:getTransactions({limit:30}) };
+function rowToTx_(r) {
+  return {
+    id: r[0], date: formatDate_(r[1]), type: r[2], businessType: r[3], category: r[4],
+    projectId: r[5] || '', customer: r[6] || '', description: r[7] || '', amount: Number(r[8] || 0),
+    paymentMethod: r[9] || '', account: r[10] || '', paymentStatus: r[11] || '', note: r[12] || '',
+    createdAt: formatDateTime_(r[13])
+  };
 }
 
-function validateTransaction_(d) {
-  if (!d) throw new Error('缺少資料');
-  ['date','type','businessType','category','amount'].forEach(k => {
-    if (d[k] === undefined || d[k] === null || d[k] === '') throw new Error('欄位不可空白：' + k);
-  });
-  if (!['收入','支出'].includes(d.type)) throw new Error('收入/支出格式錯誤');
-  if (Number(d.amount) <= 0) throw new Error('金額必須大於 0');
-}
-
-function parseDate_(s) {
-  const parts = String(s).split('-').map(Number);
-  return new Date(parts[0], parts[1]-1, parts[2]);
-}
-
+/**
+ * 只把「真正要回傳的那幾筆」轉成物件。
+ * 原本是全部轉成物件 + 字串排序，再切 30 筆，資料越多越慢。
+ */
 function getTransactions(filter) {
   filter = filter || {};
-  const sh = getSpreadsheet_().getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
-  const rows = getRows_(sh);
-  let list = rows.map(r => ({
-    id:r[0], date:formatDate_(r[1]), type:r[2], businessType:r[3], category:r[4], projectId:r[5]||'', customer:r[6]||'', description:r[7]||'', amount:Number(r[8]||0), paymentMethod:r[9]||'', account:r[10]||'', paymentStatus:r[11]||'', note:r[12]||'', createdAt:formatDateTime_(r[13])
+  let rows = getTransactionRows_();
+
+  if (filter.businessType) rows = rows.filter(r => r[3] === filter.businessType);
+  if (filter.type) rows = rows.filter(r => r[2] === filter.type);
+  if (filter.month) rows = rows.filter(r => formatDate_(r[1]).indexOf(filter.month) === 0);
+
+  const idx = rows.map((r, i) => ({
+    i: i,
+    d: r[1] ? new Date(r[1]).getTime() : 0,
+    c: r[13] ? new Date(r[13]).getTime() : 0
   }));
+  idx.sort((a, b) => (b.d - a.d) || (b.c - a.c));
 
-  if (filter.businessType) list = list.filter(x => x.businessType === filter.businessType);
-  if (filter.type) list = list.filter(x => x.type === filter.type);
-  if (filter.month) list = list.filter(x => x.date.startsWith(filter.month));
-
-  list.sort((a,b) => (b.date + b.createdAt).localeCompare(a.date + a.createdAt));
-  if (filter.limit) list = list.slice(0, Number(filter.limit));
-  return list;
+  const picked = filter.limit ? idx.slice(0, Number(filter.limit)) : idx;
+  return picked.map(o => rowToTx_(rows[o.i]));
 }
 
 function getDashboard() {
-  const ss = getSpreadsheet_();
-  const sh = ss.getSheetByName(CONFIG.SHEETS.TRANSACTIONS);
-  const rows = getRows_(sh);
+  const rows = getTransactionRows_();
   const now = new Date();
   const y = now.getFullYear();
   const m = now.getMonth();
@@ -192,13 +260,13 @@ function getDashboard() {
   let revenue = 0;
   let expenses = 0;
   const byBusiness = {};
-  ['AI課程','接案','電動車','設計製作','顧問','工作室共用'].forEach(k => byBusiness[k] = { revenue:0, expense:0, profit:0, margin:0 });
+  BUSINESS_TYPES.forEach(k => byBusiness[k] = { revenue: 0, expense: 0, profit: 0, margin: 0 });
 
   rows.forEach(r => {
     const d = new Date(r[1]);
     if (d.getFullYear() !== y || d.getMonth() !== m) return;
-    const type = r[2], biz = r[3] || '工作室共用', amount = Number(r[8]||0);
-    if (!byBusiness[biz]) byBusiness[biz] = { revenue:0, expense:0, profit:0, margin:0 };
+    const type = r[2], biz = r[3] || '工作室共用', amount = Number(r[8] || 0);
+    if (!byBusiness[biz]) byBusiness[biz] = { revenue: 0, expense: 0, profit: 0, margin: 0 };
     if (type === '收入') { revenue += amount; byBusiness[biz].revenue += amount; }
     if (type === '支出') { expenses += amount; byBusiness[biz].expense += amount; }
   });
@@ -209,7 +277,7 @@ function getDashboard() {
     b.margin = b.revenue > 0 ? (b.profit / b.revenue) * 100 : 0;
   });
 
-  const fixedCosts = getFixedCosts_().reduce((s,x)=>s+x.amount,0);
+  const fixedCosts = getFixedCosts_().reduce((s, x) => s + x.amount, 0);
   const settings = getSettingsMap_();
   const ownerSalary = Number(settings.OWNER_SALARY_TARGET || 0);
   const cashBalance = Number(settings.CASH_BALANCE || 0);
@@ -224,13 +292,13 @@ function getDashboard() {
   if (runway >= safeMonths && netProfit >= 0) health = '綠燈';
   else if (runway >= lowMonths) health = '黃燈';
 
-  const totalBusinessRevenue = Object.values(byBusiness).reduce((s,b)=>s+b.revenue,0);
-  const totalBusinessExpense = Object.values(byBusiness).reduce((s,b)=>s+b.expense,0);
-  const avgMargin = totalBusinessRevenue > 0 ? (totalBusinessRevenue-totalBusinessExpense)/totalBusinessRevenue : 0;
+  const totalBusinessRevenue = Object.values(byBusiness).reduce((s, b) => s + b.revenue, 0);
+  const totalBusinessExpense = Object.values(byBusiness).reduce((s, b) => s + b.expense, 0);
+  const avgMargin = totalBusinessRevenue > 0 ? (totalBusinessRevenue - totalBusinessExpense) / totalBusinessRevenue : 0;
   const breakevenRevenue = avgMargin > 0 ? (fixedCosts + ownerSalary) / avgMargin : 0;
 
   return {
-    month: Utilities.formatDate(now, Session.getScriptTimeZone() || 'Asia/Taipei', 'yyyy-MM'),
+    month: Utilities.formatDate(now, getTz_(), 'yyyy-MM'),
     revenue, expenses, netProfit, fixedCosts, ownerSalary, cashBalance,
     runwayMonths: runway,
     health,
@@ -240,41 +308,84 @@ function getDashboard() {
   };
 }
 
-function getSettingsMap_() {
-  const sh = getSpreadsheet_().getSheetByName(CONFIG.SHEETS.SETTINGS);
-  const rows = getRows_(sh);
-  const out = {};
-  rows.forEach(r => out[r[0]] = r[1]);
-  return out;
+/* ===================================================================
+ * 寫入
+ * =================================================================== */
+function addTransaction(data) {
+  validateTransaction_(data);
+  const sh = getSheet_(CONFIG.SHEETS.TRANSACTIONS);
+  const id = 'TX-' + Utilities.getUuid().slice(0, 8).toUpperCase();
+  const row = [
+    id,
+    parseDate_(data.date),
+    data.type,
+    data.businessType,
+    data.category,
+    data.projectId || '',
+    data.customer || '',
+    data.description || '',
+    Number(data.amount),
+    data.paymentMethod || '',
+    data.account || '',
+    data.paymentStatus || '已收/付',
+    data.note || '',
+    new Date()
+  ];
+  sh.appendRow(row);
+
+  // 直接把新資料塞進這次請求的快取，儀表板與帳本就不用再讀一次整張表。
+  if (TX_ROWS_) TX_ROWS_.push(row);
+  else TX_ROWS_ = getRows_(sh);
+
+  return { ok: true, id: id, dashboard: getDashboard(), recentTransactions: getTransactions({ limit: 30 }) };
+}
+
+function validateTransaction_(d) {
+  if (!d) throw new Error('缺少資料');
+  ['date', 'type', 'businessType', 'category', 'amount'].forEach(k => {
+    if (d[k] === undefined || d[k] === null || d[k] === '') throw new Error('欄位不可空白：' + k);
+  });
+  if (!['收入', '支出'].includes(d.type)) throw new Error('收入/支出格式錯誤');
+  if (Number(d.amount) <= 0) throw new Error('金額必須大於 0');
 }
 
 function saveSettings(data) {
-  const sh = getSpreadsheet_().getSheetByName(CONFIG.SHEETS.SETTINGS);
+  const sh = getSheet_(CONFIG.SHEETS.SETTINGS);
   const rows = getRows_(sh);
   const keyToRow = {};
-  rows.forEach((r,i)=> keyToRow[r[0]] = i+2);
+  rows.forEach((r, i) => keyToRow[r[0]] = i + 2);
   Object.keys(data || {}).forEach(key => {
-    if (keyToRow[key]) sh.getRange(keyToRow[key],2).setValue(data[key]);
+    if (keyToRow[key]) sh.getRange(keyToRow[key], 2).setValue(data[key]);
     else sh.appendRow([key, data[key], '']);
   });
-  return { ok:true, dashboard:getDashboard() };
+  cacheClear_();
+  return { ok: true, dashboard: getDashboard() };
 }
 
 function addFixedCost(data) {
   if (!data || !data.item || Number(data.amount) <= 0) throw new Error('固定成本資料不完整');
-  const sh = getSpreadsheet_().getSheetByName(CONFIG.SHEETS.FIXED_COSTS);
-  sh.appendRow([data.item, Number(data.amount), data.category || '其他', true, data.note || '']);
-  return { ok:true, fixedCosts:getFixedCosts_(), dashboard:getDashboard() };
+  getSheet_(CONFIG.SHEETS.FIXED_COSTS)
+    .appendRow([data.item, Number(data.amount), data.category || '其他', true, data.note || '']);
+  cacheClear_();
+  return { ok: true, fixedCosts: getFixedCosts_(), dashboard: getDashboard() };
+}
+
+/* ===================================================================
+ * 工具
+ * =================================================================== */
+function parseDate_(s) {
+  const parts = String(s).split('-').map(Number);
+  return new Date(parts[0], parts[1] - 1, parts[2]);
 }
 
 function formatDate_(d) {
   if (!d) return '';
-  return Utilities.formatDate(new Date(d), Session.getScriptTimeZone() || 'Asia/Taipei', 'yyyy-MM-dd');
+  return Utilities.formatDate(new Date(d), getTz_(), 'yyyy-MM-dd');
 }
 
 function formatDateTime_(d) {
   if (!d) return '';
-  return Utilities.formatDate(new Date(d), Session.getScriptTimeZone() || 'Asia/Taipei', 'yyyy-MM-dd HH:mm:ss');
+  return Utilities.formatDate(new Date(d), getTz_(), 'yyyy-MM-dd HH:mm:ss');
 }
 
 function asBool_(v) {
