@@ -12,6 +12,12 @@ const CONFIG = {
     FIXED_COSTS: 'FixedCosts',
     SETTINGS: 'Settings'
   },
+  BACKUP: {
+    FOLDER_NAME: '工作室財務APP備份',
+    EXPORT_FOLDER_NAME: 'CSV匯出',
+    KEEP: 30,
+    HOUR: 3
+  },
   CACHE_SECONDS: 300,
   SETUP_VERSION: 'v1'
 };
@@ -368,6 +374,129 @@ function addFixedCost(data) {
     .appendRow([data.item, Number(data.amount), data.category || '其他', true, data.note || '']);
   cacheClear_();
   return { ok: true, fixedCosts: getFixedCosts_(), dashboard: getDashboard() };
+}
+
+/* ===================================================================
+ * 備份機制
+ * =================================================================== */
+function getBackupFolder_() {
+  const it = DriveApp.getFoldersByName(CONFIG.BACKUP.FOLDER_NAME);
+  return it.hasNext() ? it.next() : DriveApp.createFolder(CONFIG.BACKUP.FOLDER_NAME);
+}
+
+/** 複製整份 Sheet 到 Drive 備份資料夾，並保留最近 N 份。 */
+function backupNow() {
+  const ss = getSpreadsheet_();
+  const folder = getBackupFolder_();
+  const stamp = Utilities.formatDate(new Date(), getTz_(), 'yyyy-MM-dd_HHmm');
+  const copy = DriveApp.getFileById(CONFIG.SPREADSHEET_ID)
+    .makeCopy('備份_' + stamp + '_' + ss.getName(), folder);
+  const removed = pruneBackups_(folder);
+  return {
+    ok: true,
+    name: copy.getName(),
+    url: copy.getUrl(),
+    folderUrl: folder.getUrl(),
+    removed: removed
+  };
+}
+
+/** 超過保留份數的舊備份移到垃圾桶（不是永久刪除，30 天內都救得回來）。 */
+function pruneBackups_(folder) {
+  const files = [];
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    files.push({ f: f, t: f.getDateCreated().getTime() });
+  }
+  files.sort((a, b) => b.t - a.t);
+  const old = files.slice(CONFIG.BACKUP.KEEP);
+  old.forEach(o => o.f.setTrashed(true));
+  return old.length;
+}
+
+function installBackupTrigger() {
+  removeBackupTrigger();
+  ScriptApp.newTrigger('backupNow')
+    .timeBased()
+    .atHour(CONFIG.BACKUP.HOUR)
+    .everyDays(1)
+    .create();
+  return { ok: true, message: '每日自動備份已啟用（約凌晨 ' + CONFIG.BACKUP.HOUR + ' 點）' };
+}
+
+function removeBackupTrigger() {
+  let n = 0;
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === 'backupNow') { ScriptApp.deleteTrigger(t); n++; }
+  });
+  return { ok: true, removed: n };
+}
+
+function getBackupStatus() {
+  const enabled = ScriptApp.getProjectTriggers()
+    .some(t => t.getHandlerFunction() === 'backupNow');
+
+  const folder = getBackupFolder_();
+  let count = 0;
+  let latest = null;
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    count++;
+    const t = f.getDateCreated();
+    if (!latest || t.getTime() > latest.getTime()) latest = t;
+  }
+  return {
+    enabled: enabled,
+    count: count,
+    keep: CONFIG.BACKUP.KEEP,
+    latest: latest ? Utilities.formatDate(latest, getTz_(), 'yyyy-MM-dd HH:mm') : '',
+    folderUrl: folder.getUrl()
+  };
+}
+
+/* ===================================================================
+ * CSV 匯出
+ * =================================================================== */
+function csvCell_(v) {
+  const s = (v === null || v === undefined) ? '' : String(v);
+  return '"' + s.replace(/"/g, '""') + '"';
+}
+
+function getExportFolder_() {
+  const parent = getBackupFolder_();
+  const it = parent.getFoldersByName(CONFIG.BACKUP.EXPORT_FOLDER_NAME);
+  return it.hasNext() ? it.next() : parent.createFolder(CONFIG.BACKUP.EXPORT_FOLDER_NAME);
+}
+
+/**
+ * 匯出 CSV 到 Drive 並回傳連結。
+ * 不用瀏覽器直接下載，是因為 Apps Script 網頁被包在 iframe 沙箱裡，
+ * 直接觸發下載常被擋；存到 Drive 再開連結最穩，而且等於多一份備份。
+ */
+function exportTransactionsCsv(filter) {
+  const list = getTransactions(filter || {});
+  const lines = [TX_HEADERS.map(csvCell_).join(',')];
+  list.forEach(t => {
+    lines.push([
+      t.id, t.date, t.type, t.businessType, t.category, t.projectId, t.customer,
+      t.description, t.amount, t.paymentMethod, t.account, t.paymentStatus, t.note, t.createdAt
+    ].map(csvCell_).join(','));
+  });
+
+  const filename = '帳本_' + Utilities.formatDate(new Date(), getTz_(), 'yyyyMMdd_HHmm') + '.csv';
+  // 開頭加 BOM，Excel 打開中文才不會變亂碼
+  const blob = Utilities.newBlob('\ufeff' + lines.join('\r\n'), 'text/csv', filename);
+  const file = getExportFolder_().createFile(blob);
+
+  return {
+    ok: true,
+    rows: list.length,
+    filename: filename,
+    url: file.getUrl(),
+    downloadUrl: 'https://drive.google.com/uc?export=download&id=' + file.getId()
+  };
 }
 
 /* ===================================================================

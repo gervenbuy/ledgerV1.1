@@ -71,6 +71,13 @@
       <div class="card"><h2 style="margin-top:0">財務設定</h2><div class="field"><label>目前工作室可動用現金</label><input id="cashBalance" type="number"></div><div class="field" style="margin-top:10px"><label>老闆月薪目標</label><input id="ownerSalary" type="number"></div><button class="primary" style="margin-top:12px;width:100%" onclick="saveSettings()">儲存設定</button></div>
       <div class="card"><h2 style="margin-top:0">固定成本</h2><div id="fixedList" class="subtitle"></div></div>
       <div class="card"><h2 style="margin-top:0">新增固定成本</h2><div class="field"><label>項目</label><input id="fixedItem"></div><div class="field" style="margin-top:8px"><label>每月金額</label><input id="fixedAmount" type="number"></div><div class="field" style="margin-top:8px"><label>分類</label><input id="fixedCategory" value="其他"></div><button class="primary" style="margin-top:12px;width:100%" onclick="addFixedCost()">新增</button></div>
+      <div class="card"><h2 style="margin-top:0">資料備份</h2>
+        <div class="subtitle" id="backupStatus" style="line-height:1.7">尚未讀取</div>
+        <button class="primary" style="margin-top:12px;width:100%" onclick="runBackup()">立即備份一份</button>
+        <button class="ghost" id="backupToggle" style="margin-top:8px;width:100%" onclick="toggleDailyBackup()">讀取中…</button>
+        <button class="ghost" style="margin-top:8px;width:100%" onclick="exportCsv()">匯出 CSV</button>
+        <div class="subtitle" style="margin-top:10px;line-height:1.6">備份存在 Google Drive 的「工作室財務APP備份」資料夾，自動保留最近 30 份，超過的移到垃圾桶。</div>
+      </div>
     </div>
   </section>
 </div>
@@ -81,7 +88,7 @@ const $=id=>document.getElementById(id); const money=n=>'$'+Math.round(Number(n|
 const todayStr=()=>{ const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); };
 function init(){ $('date').value=todayStr(); bindTabs(); refreshAll(); }
 function bindTabs(){ document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>showPage(b.dataset.page))); }
-function showPage(id){ document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id===id)); document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.page===id)); if(id==='entry') setTimeout(()=>$('amount').focus(),50); }
+function showPage(id){ document.querySelectorAll('.page').forEach(p=>p.classList.toggle('active',p.id===id)); document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.page===id)); if(id==='entry') setTimeout(()=>$('amount').focus(),50); if(id==='settings') loadBackupStatus(); }
 function setLoading(on){ $('app').classList.toggle('loading',on); }
 function toast(msg){ const t=$('toast'); t.textContent=msg; t.style.display='block'; setTimeout(()=>t.style.display='none',1800); }
 function callServer(method,...args){ return new Promise((resolve,reject)=>{ const runner=google.script.run.withSuccessHandler(resolve).withFailureHandler(e=>reject(new Error(e.message||e))); const fn=runner[method]; if(typeof fn!=='function'){ reject(new Error('未知的伺服器方法：'+method)); return; } fn.apply(runner,args); }); }
@@ -97,6 +104,13 @@ function renderFixedCosts(){ const list=state.fixedCosts||[]; $('fixedList').inn
 async function saveTransaction(){ const data={date:$('date').value,type:state.type,businessType:$('businessType').value,category:$('category').value,customer:$('customer').value,description:$('description').value,amount:Number($('amount').value),account:$('account').value,paymentMethod:$('paymentMethod').value,paymentStatus:$('paymentStatus').value,projectId:$('projectId').value,note:$('note').value}; if(!data.date||!data.amount){toast('請填日期與金額');return;} try{setLoading(true); const res=await callServer('addTransaction',data); state.dashboard=res.dashboard; state.recentTransactions=res.recentTransactions; renderAll(); ['amount','customer','description','projectId','note'].forEach(id=>$(id).value=''); toast('已儲存'); showPage('dashboard');}catch(e){alert(e.message)}finally{setLoading(false);} }
 async function saveSettings(){ try{setLoading(true); const res=await callServer('saveSettings',{CASH_BALANCE:Number($('cashBalance').value||0),OWNER_SALARY_TARGET:Number($('ownerSalary').value||0)}); state.dashboard=res.dashboard; renderDashboard(); toast('設定已儲存');}catch(e){alert(e.message)}finally{setLoading(false);} }
 async function addFixedCost(){ const data={item:$('fixedItem').value,amount:Number($('fixedAmount').value),category:$('fixedCategory').value}; if(!data.item||!data.amount){toast('請填項目與金額');return;} try{setLoading(true); const res=await callServer('addFixedCost',data); state.fixedCosts=res.fixedCosts; state.dashboard=res.dashboard; renderAll(); $('fixedItem').value='';$('fixedAmount').value=''; toast('固定成本已新增');}catch(e){alert(e.message)}finally{setLoading(false);} }
+/* ---------- 備份與匯出 ---------- */
+let backupState={enabled:false};
+async function loadBackupStatus(){ try{ const s=await callServer('getBackupStatus'); backupState=s; $('backupStatus').innerHTML='自動備份：<strong>'+(s.enabled?'已啟用（每日凌晨 3 點）':'未啟用')+'</strong><br>目前份數：'+s.count+' / '+s.keep+(s.latest?'<br>最近一次：'+s.latest:'')+'<br><a href="'+s.folderUrl+'" target="_blank">開啟備份資料夾</a>'; $('backupToggle').textContent=s.enabled?'關閉每日自動備份':'啟用每日自動備份'; }catch(e){ $('backupStatus').textContent='讀取備份狀態失敗：'+e.message; $('backupToggle').textContent='啟用每日自動備份'; } }
+async function runBackup(){ try{ setLoading(true); const r=await callServer('backupNow'); toast('備份完成'+(r.removed?'（清掉 '+r.removed+' 份舊的）':'')); await loadBackupStatus(); }catch(e){ alert('備份失敗：'+e.message); }finally{ setLoading(false); } }
+async function toggleDailyBackup(){ try{ setLoading(true); if(backupState.enabled){ await callServer('removeBackupTrigger'); toast('已關閉每日自動備份'); } else { const r=await callServer('installBackupTrigger'); toast(r.message); } await loadBackupStatus(); }catch(e){ alert(e.message); }finally{ setLoading(false); } }
+async function exportCsv(){ try{ setLoading(true); const r=await callServer('exportTransactionsCsv',{}); toast('已匯出 '+r.rows+' 筆'); window.open(r.downloadUrl,'_blank'); }catch(e){ alert('匯出失敗：'+e.message); }finally{ setLoading(false); } }
+
 window.addEventListener('load',init);
 </script>
 </body>
