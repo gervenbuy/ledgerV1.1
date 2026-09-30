@@ -1,522 +1,601 @@
 /**
- * 工作室財務健康 APP - 後端
- * V1.2 效能優化 + 備份機制
+ * 工作室財務健康 APP - Apps Script 後端 v4
+ * ============================================
+ * v4 重點：
+ *   - 業務「迪特軍EV／電動車」統一改名為「電車男電能車」（舊資料讀取時自動轉換，另可執行 upgradeToV4() 直接改寫試算表）
+ *   - 預設密碼 053005（可在 APP「設定」頁修改，新密碼存在 Script Properties，不寫在程式碼裡）
+ *   - 寫入加上 LockService，避免兩台裝置同時記帳時資料錯亂
+ *   - 防止試算表公式注入（輸入 = + - @ 開頭的文字不會被當成公式執行）
+ *   - 「個人」收支不計入工作室損益（可用 INCLUDE_PERSONAL_IN_STUDIO 切換）
+ *   - 現金續航改用近 3 個月平均燒錢速度，不會因為單月波動大起大落
+ *   - 新增：一鍵標記已收/已付、刪除固定成本、修改密碼、與上月比較、支出結構、客戶自動完成
+ *
+ * 分頁結構：
+ *   - 交易紀錄：所有收支明細
+ *   - 設定：現金餘額、老闆月薪目標
+ *   - 固定成本：每月固定支出項目
+ *
+ * 部署方式：
+ *   Apps Script 編輯器整段覆蓋貼上 → 存檔 → 執行一次 upgradeToV4 →
+ *   部署 → 管理部署作業 → 編輯現有部署 → 版本選「新版本」→ 部署
+ * ============================================
  */
-const CONFIG = {
-  SPREADSHEET_ID: '1OeJy1bhmGVMXdbbNx-l7ID5tTVJS1FCJxPNSbNJzjEU',
-  SHEETS: {
-    TRANSACTIONS: 'Transactions',
-    PROJECTS: 'Projects',
-    CATEGORIES: 'Categories',
-    ACCOUNTS: 'Accounts',
-    FIXED_COSTS: 'FixedCosts',
-    SETTINGS: 'Settings'
-  },
-  BACKUP: {
-    FOLDER_NAME: '工作室財務APP備份',
-    EXPORT_FOLDER_NAME: 'CSV匯出',
-    KEEP: 30,
-    HOUR: 3
-  },
-  CACHE_SECONDS: 300,
-  SETUP_VERSION: 'v1'
+
+// ===== 設定區 =====
+const APP_VERSION = 'v4.0';
+const DEFAULT_PASSWORD = '053005';
+
+const TRANSACTION_SHEET = '交易紀錄';
+const TRANSACTION_HEADER = ['ID', '日期', '收支類型', '業務類型', '分類', '客戶', '說明', '金額', '帳戶', '付款方式', '付款狀態', '專案ID', '備註', '建立時間', '更新時間'];
+const COL = { ID: 1, DATE: 2, TYPE: 3, BIZ: 4, STATUS: 11, UPDATED: 15 };
+
+const SETTINGS_SHEET = '設定';
+const FIXED_COST_SHEET = '固定成本';
+
+const PAID = '已收/付';
+const UNPAID = '未收/付';
+
+const EV_BIZ = '電車男電能車';
+const PERSONAL_BIZ = '個人';
+const SHARED_BIZ = '工作室共用';
+const BUSINESS_TYPES = [EV_BIZ, '電商神助手', '課程教學', SHARED_BIZ, PERSONAL_BIZ];
+
+// 個人收支要不要算進工作室的營收／支出／淨利？（false = 只顯示在「個人」卡片，不影響工作室數字）
+const INCLUDE_PERSONAL_IN_STUDIO = false;
+
+// 舊業務名稱 → 新名稱（比對時忽略大小寫與空白）
+const BUSINESS_ALIASES = {
+  '迪特軍ev': EV_BIZ,
+  '迪特軍': EV_BIZ,
+  '電動車': EV_BIZ,
+  'ev': EV_BIZ
 };
 
-const BUSINESS_TYPES = ['AI課程', '接案', '電動車', '設計製作', '顧問', '工作室共用'];
+const OLD_LEDGER_NAMES = ['個人', '迪特軍EV', '電商神助手', '課程教學'];
 
-const TX_HEADERS = ['ID', '日期', '收入/支出', '業務類型', '分類', '專案ID', '客戶', '說明', '金額', '付款方式', '帳戶', '付款狀態', '備註', '建立時間'];
+const CATEGORIES = {};
+CATEGORIES[EV_BIZ] = {
+  '收入': ['車輛銷售', '維修收入', '零件銷售', '其他收入'],
+  '支出': ['零件採購', '店租', '水電', '人事', '工具設備', '其他支出']
+};
+CATEGORIES['電商神助手'] = {
+  '收入': ['顧問服務費', 'AI行銷服務', '網站建置費', '其他收入'],
+  '支出': ['廣告投放', '軟體訂閱', '外包費用', '其他支出']
+};
+CATEGORIES['課程教學'] = {
+  '收入': ['線上課程', '實體課程', '企業培訓', '其他收入'],
+  '支出': ['場地費', '教材製作', '行銷推廣', '其他支出']
+};
+CATEGORIES[SHARED_BIZ] = {
+  '收入': ['其他收入'],
+  '支出': ['軟體訂閱', '辦公用品', '共同行銷', '雜項支出', '其他支出']
+};
+CATEGORIES[PERSONAL_BIZ] = {
+  '收入': ['薪資', '其他收入'],
+  '支出': ['餐飲', '交通', '居住', '娛樂', '醫療', '其他支出']
+};
 
-/* ===================================================================
- * 單次執行的快取層
- * Apps Script 每個請求都是全新的執行環境，所以這些變數等於
- * 「這一次請求內共用」。原本 openById 會被呼叫 8 次，現在只有 1 次。
- * =================================================================== */
-let SS_ = null;
-let TX_ROWS_ = null;
-let TZ_ = null;
+const ACCOUNTS = [{ name: '現金' }, { name: '銀行帳戶' }, { name: '電子支付' }, { name: '信用卡' }];
 
-function getSpreadsheet_() {
-  if (SS_) return SS_;
-  if (!CONFIG.SPREADSHEET_ID || CONFIG.SPREADSHEET_ID.indexOf('PUT_YOUR') >= 0) {
-    throw new Error('請先在 Code.gs 的 CONFIG.SPREADSHEET_ID 貼上你的 Google Sheet ID。');
-  }
-  SS_ = SpreadsheetApp.openById(CONFIG.SPREADSHEET_ID);
-  return SS_;
-}
+// ===== 主要進入點 =====
+function doGet(e) { return handleRequest(e); }
+function doPost(e) { return handleRequest(e); }
 
-function getSheet_(name) {
-  const sh = getSpreadsheet_().getSheetByName(name);
-  if (!sh) throw new Error('找不到工作表：' + name + '（請手動執行一次 setupSpreadsheet）');
-  return sh;
-}
+const ACTIONS = {
+  getBootstrapData: function (r) { return getBootstrapData(r.month); },
+  addTransaction: function (r) { const t = addTransaction(r.data); return getBootstrapData(t.date.substring(0, 7)); },
+  updateTransaction: function (r) { const t = updateTransaction(r.data); return getBootstrapData(t.date.substring(0, 7)); },
+  deleteTransaction: function (r) { deleteTransaction(r.data && r.data.id); return getBootstrapData(r.month); },
+  setPaymentStatus: function (r) { setPaymentStatus(r.data); return getBootstrapData(r.month); },
+  saveSettings: function (r) { saveSettings(r.data); return getBootstrapData(r.month); },
+  addFixedCost: function (r) { addFixedCost(r.data); return getBootstrapData(r.month); },
+  deleteFixedCost: function (r) { deleteFixedCost(r.data); return getBootstrapData(r.month); },
+  changePassword: function (r) { changePassword(r.data); return {}; }
+};
 
-function getTz_() {
-  if (!TZ_) TZ_ = Session.getScriptTimeZone() || 'Asia/Taipei';
-  return TZ_;
-}
-
-/** Transactions 整張表在一次請求內只讀一次，儀表板與帳本共用。 */
-function getTransactionRows_() {
-  if (TX_ROWS_) return TX_ROWS_;
-  TX_ROWS_ = getRows_(getSheet_(CONFIG.SHEETS.TRANSACTIONS));
-  return TX_ROWS_;
-}
-
-/* ===================================================================
- * 跨請求快取：分類 / 帳戶 / 固定成本 / 設定很少變動
- * =================================================================== */
-function cacheGet_(key, producer) {
-  const cache = CacheService.getScriptCache();
-  const hit = cache.get(key);
-  if (hit) {
-    try {
-      return JSON.parse(hit);
-    } catch (e) {
-      // 快取內容壞掉就重算
-    }
-  }
-  const value = producer();
+function handleRequest(e) {
   try {
-    cache.put(key, JSON.stringify(value), CONFIG.CACHE_SECONDS);
-  } catch (e) {
-    // 超過快取大小上限就跳過，不影響功能
-  }
-  return value;
-}
-
-function cacheClear_() {
-  CacheService.getScriptCache().removeAll(['cat', 'acc', 'fixed', 'settings']);
-}
-
-/* ===================================================================
- * 入口
- * =================================================================== */
-function doGet() {
-  return HtmlService.createTemplateFromFile('Index')
-    .evaluate()
-    .setTitle('工作室財務健康 APP')
-    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover')
-    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
-}
-
-/**
- * 只在第一次（或換版本）時建表。
- * 原本每次開 APP 都跑 setupSpreadsheet()，等於白做 20 次以上的 Sheet 操作。
- */
-function ensureReady_() {
-  const props = PropertiesService.getScriptProperties();
-  if (props.getProperty('SETUP_DONE') === CONFIG.SETUP_VERSION) return;
-  setupSpreadsheet();
-}
-
-function setupSpreadsheet() {
-  const ss = getSpreadsheet_();
-
-  ensureSheet_(ss, CONFIG.SHEETS.TRANSACTIONS, TX_HEADERS);
-  ensureSheet_(ss, CONFIG.SHEETS.PROJECTS, [
-    '專案ID', '專案名稱', '客戶', '業務類型', '開始日期', '結束日期', '報價', '狀態', '備註'
-  ]);
-  ensureSheet_(ss, CONFIG.SHEETS.CATEGORIES, ['類型', '分類名稱', '業務類型', '啟用']);
-  ensureSheet_(ss, CONFIG.SHEETS.ACCOUNTS, ['帳戶名稱', '帳戶類型', '期初餘額', '啟用']);
-  ensureSheet_(ss, CONFIG.SHEETS.FIXED_COSTS, ['項目', '每月金額', '分類', '啟用', '備註']);
-  ensureSheet_(ss, CONFIG.SHEETS.SETTINGS, ['設定鍵', '設定值', '說明']);
-
-  seedDefaults_(ss);
-  cacheClear_();
-  PropertiesService.getScriptProperties().setProperty('SETUP_DONE', CONFIG.SETUP_VERSION);
-  return { ok: true, message: '資料表初始化完成' };
-}
-
-function ensureSheet_(ss, name, headers) {
-  let sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  if (sh.getLastRow() === 0) {
-    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
-    sh.setFrozenRows(1);
-    sh.getRange(1, 1, 1, headers.length).setFontWeight('bold');
-  }
-  return sh;
-}
-
-function seedDefaults_(ss) {
-  const cat = ss.getSheetByName(CONFIG.SHEETS.CATEGORIES);
-  if (cat.getLastRow() <= 1) {
-    const rows = [
-      ['收入', 'AI課程', 'AI課程', true], ['收入', '接案收入', '接案', true], ['收入', '維修收入', '電動車', true], ['收入', '車輛銷售', '電動車', true], ['收入', '設計收入', '設計製作', true], ['收入', '顧問費', '顧問', true],
-      ['支出', '租金', '工作室共用', true], ['支出', '軟體訂閱', '工作室共用', true], ['支出', '廣告', '工作室共用', true], ['支出', '電話網路', '工作室共用', true], ['支出', '車輛分期', '工作室共用', true],
-      ['支出', '教材印刷', 'AI課程', true], ['支出', '交通', '工作室共用', true], ['支出', '外包', '接案', true], ['支出', '零件', '電動車', true], ['支出', '進貨', '電動車', true], ['支出', '印刷製作', '設計製作', true], ['支出', '其他', '工作室共用', true]
-    ];
-    cat.getRange(2, 1, rows.length, 4).setValues(rows);
-  }
-
-  const accounts = ss.getSheetByName(CONFIG.SHEETS.ACCOUNTS);
-  if (accounts.getLastRow() <= 1) {
-    accounts.getRange(2, 1, 4, 4).setValues([
-      ['工作室銀行', '銀行', 0, true], ['現金', '現金', 0, true], ['信用卡', '信用卡', 0, true], ['個人代墊', '其他', 0, true]
-    ]);
-  }
-
-  const fixed = ss.getSheetByName(CONFIG.SHEETS.FIXED_COSTS);
-  if (fixed.getLastRow() <= 1) {
-    fixed.getRange(2, 1, 9, 5).setValues([
-      ['工作室租金', 19000, '租金', true, ''], ['ChatGPT', 650, '軟體訂閱', true, ''], ['Gemini', 650, '軟體訂閱', true, ''], ['Claude', 760, '軟體訂閱', true, '依實際台幣帳單調整'], ['Kling', 610, '軟體訂閱', true, '依實際台幣帳單調整'], ['Google Ads', 3000, '廣告', true, ''], ['Facebook Ads', 3000, '廣告', true, ''], ['電話＋網路', 2000, '電話網路', true, ''], ['貨車分期', 4790, '車輛分期', true, '48期']
-    ]);
-  }
-
-  const settings = ss.getSheetByName(CONFIG.SHEETS.SETTINGS);
-  if (settings.getLastRow() <= 1) {
-    settings.getRange(2, 1, 4, 3).setValues([
-      ['OWNER_SALARY_TARGET', 40000, '老闆每月希望領取金額'], ['CASH_BALANCE', 0, '目前工作室可動用現金'], ['SAFE_MONTHS', 6, '健康現金續航月份'], ['LOW_MONTHS', 3, '危險現金續航月份']
-    ]);
+    const req = parseRequest(e);
+    if (req.action === 'verifyPassword') {
+      return jsonResponse({ success: checkPassword(req.password) });
+    }
+    if (!checkPassword(req.password)) {
+      return jsonResponse({ success: false, code: 'AUTH', error: '密碼錯誤或未驗證' });
+    }
+    const handler = ACTIONS[req.action];
+    if (!handler) return jsonResponse({ success: false, error: '未知的操作: ' + req.action });
+    return jsonResponse(Object.assign({ success: true }, handler(req)));
+  } catch (err) {
+    return jsonResponse({ success: false, error: (err && err.message) || String(err) });
   }
 }
 
-/* ===================================================================
- * 讀取
- * =================================================================== */
-function getBootstrapData() {
-  ensureReady_();
-  return {
-    businessTypes: BUSINESS_TYPES,
-    categories: getCategories_(),
-    accounts: getAccounts_(),
-    fixedCosts: getFixedCosts_(),
-    dashboard: getDashboard(),
-    recentTransactions: getTransactions({ limit: 30 })
-  };
+function parseRequest(e) {
+  if (e && e.postData && e.postData.contents) {
+    const body = JSON.parse(e.postData.contents);
+    return { action: body.action, password: body.password, month: body.month, data: body.data };
+  }
+  const p = (e && e.parameter) || {};
+  return { action: p.action, password: p.password, month: p.month, data: p.data ? JSON.parse(p.data) : null };
 }
 
-function getCategories_() {
-  return cacheGet_('cat', function () {
-    return getRows_(getSheet_(CONFIG.SHEETS.CATEGORIES))
-      .filter(r => asBool_(r[3]))
-      .map(r => ({ type: r[0], name: r[1], businessType: r[2] }));
+// ===== 密碼 =====
+function getPassword() {
+  return PropertiesService.getScriptProperties().getProperty('ACCESS_PASSWORD') || DEFAULT_PASSWORD;
+}
+function checkPassword(pw) {
+  return String(pw == null ? '' : pw) === getPassword();
+}
+function changePassword(data) {
+  const pw = String((data && data.newPassword) || '').trim();
+  if (!/^\S{4,32}$/.test(pw)) throw new Error('新密碼需 4～32 個字元，不能有空白');
+  PropertiesService.getScriptProperties().setProperty('ACCESS_PASSWORD', pw);
+}
+// 忘記密碼時：在 Apps Script 編輯器執行這個函式，就會恢復成預設密碼 053005
+function resetPasswordToDefault() {
+  PropertiesService.getScriptProperties().deleteProperty('ACCESS_PASSWORD');
+  Logger.log('密碼已重設為預設值 ' + DEFAULT_PASSWORD);
+}
+
+// ===== 工具函式 =====
+function jsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+let _tz = null;
+function tz() {
+  if (!_tz) _tz = SpreadsheetApp.getActiveSpreadsheet().getSpreadsheetTimeZone() || 'Asia/Taipei';
+  return _tz;
+}
+function nowStr() { return Utilities.formatDate(new Date(), tz(), 'yyyy-MM-dd HH:mm:ss'); }
+
+// 把 Sheet 讀出來的日期值統一轉成 'yyyy-MM-dd'（Date 物件、2026/9/1、2026-09-01 都可以）
+function toYMD(val) {
+  if (val === null || val === undefined || val === '') return '';
+  if (Object.prototype.toString.call(val) === '[object Date]') {
+    return isNaN(val.getTime()) ? '' : Utilities.formatDate(val, tz(), 'yyyy-MM-dd');
+  }
+  const m = String(val).match(/(\d{4})[-\/.](\d{1,2})[-\/.](\d{1,2})/);
+  if (!m) return '';
+  return m[1] + '-' + ('0' + m[2]).slice(-2) + '-' + ('0' + m[3]).slice(-2);
+}
+function toStamp(val) {
+  if (Object.prototype.toString.call(val) === '[object Date]') return Utilities.formatDate(val, tz(), 'yyyy-MM-dd HH:mm:ss');
+  return String(val || '');
+}
+
+function shiftMonth(yyyyMM, delta) {
+  const parts = yyyyMM.split('-');
+  let y = parseInt(parts[0], 10);
+  let m = parseInt(parts[1], 10) + delta;
+  while (m < 1) { m += 12; y -= 1; }
+  while (m > 12) { m -= 12; y += 1; }
+  return y + '-' + (m < 10 ? '0' + m : m);
+}
+
+function normBiz(b) {
+  const s = String(b == null ? '' : b).trim();
+  const key = s.replace(/\s/g, '').toLowerCase();
+  return BUSINESS_ALIASES[key] || s;
+}
+
+function str(v) { return String(v == null ? '' : v).trim().slice(0, 500); }
+
+// 防止文字被試算表當成公式執行
+function safeText(v) {
+  const s = str(v);
+  return /^[=+\-@]/.test(s) ? "'" + s : s;
+}
+
+function withLock(fn) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) throw new Error('系統忙碌中，請稍後再試');
+  try { return fn(); } finally { lock.releaseLock(); }
+}
+
+function genId() {
+  return 'T' + new Date().getTime() + Math.floor(Math.random() * 1000);
+}
+
+function getSheetOrCreate(name, header) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(name);
+  if (!sheet) sheet = ss.insertSheet(name);
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(header);
+    sheet.getRange(1, 1, 1, header.length).setFontWeight('bold');
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+function getTransactionSheet() { return getSheetOrCreate(TRANSACTION_SHEET, TRANSACTION_HEADER); }
+function getSettingsSheet() { return getSheetOrCreate(SETTINGS_SHEET, ['項目', '數值']); }
+function getFixedCostSheet() { return getSheetOrCreate(FIXED_COST_SHEET, ['項目', '金額', '分類']); }
+
+function findRowById(sheet, id) {
+  if (!id) return -1;
+  const cell = sheet.getRange('A:A').createTextFinder(String(id)).matchEntireCell(true).findNext();
+  return cell ? cell.getRow() : -1;
+}
+
+// ===== 交易 =====
+function readTransactions() {
+  const sheet = getTransactionSheet();
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return [];
+  const data = sheet.getRange(2, 1, lastRow - 1, TRANSACTION_HEADER.length).getValues();
+  const list = [];
+  data.forEach(function (row) {
+    const type = row[2];
+    if (type !== '收入' && type !== '支出') return; // 跳過異常列
+    const date = toYMD(row[1]);
+    if (!date) return;
+    list.push({
+      id: String(row[0]),
+      date: date,
+      type: type,
+      businessType: normBiz(row[3]),
+      category: str(row[4]),
+      customer: str(row[5]),
+      description: str(row[6]),
+      amount: parseFloat(row[7]) || 0,
+      account: str(row[8]),
+      paymentMethod: str(row[9]),
+      paymentStatus: row[10] === UNPAID ? UNPAID : PAID,
+      projectId: str(row[11]),
+      note: str(row[12]),
+      createdAt: toStamp(row[13])
+    });
   });
+  return list;
 }
 
-function getAccounts_() {
-  return cacheGet_('acc', function () {
-    return getRows_(getSheet_(CONFIG.SHEETS.ACCOUNTS))
-      .filter(r => asBool_(r[3]))
-      .map(r => ({ name: r[0], type: r[1], openingBalance: Number(r[2] || 0) }));
-  });
-}
-
-function getFixedCosts_() {
-  return cacheGet_('fixed', function () {
-    return getRows_(getSheet_(CONFIG.SHEETS.FIXED_COSTS))
-      .filter(r => asBool_(r[3]))
-      .map(r => ({ item: r[0], amount: Number(r[1] || 0), category: r[2], note: r[4] || '' }));
-  });
-}
-
-function getSettingsMap_() {
-  return cacheGet_('settings', function () {
-    const out = {};
-    getRows_(getSheet_(CONFIG.SHEETS.SETTINGS)).forEach(r => out[r[0]] = r[1]);
-    return out;
-  });
-}
-
-function getRows_(sh) {
-  const lr = sh.getLastRow();
-  const lc = sh.getLastColumn();
-  if (lr <= 1 || lc === 0) return [];
-  return sh.getRange(2, 1, lr - 1, lc).getValues();
-}
-
-function rowToTx_(r) {
-  return {
-    id: r[0], date: formatDate_(r[1]), type: r[2], businessType: r[3], category: r[4],
-    projectId: r[5] || '', customer: r[6] || '', description: r[7] || '', amount: Number(r[8] || 0),
-    paymentMethod: r[9] || '', account: r[10] || '', paymentStatus: r[11] || '', note: r[12] || '',
-    createdAt: formatDateTime_(r[13])
-  };
-}
-
-/**
- * 只把「真正要回傳的那幾筆」轉成物件。
- * 原本是全部轉成物件 + 字串排序，再切 30 筆，資料越多越慢。
- */
-function getTransactions(filter) {
-  filter = filter || {};
-  let rows = getTransactionRows_();
-
-  if (filter.businessType) rows = rows.filter(r => r[3] === filter.businessType);
-  if (filter.type) rows = rows.filter(r => r[2] === filter.type);
-  if (filter.month) rows = rows.filter(r => formatDate_(r[1]).indexOf(filter.month) === 0);
-
-  const idx = rows.map((r, i) => ({
-    i: i,
-    d: r[1] ? new Date(r[1]).getTime() : 0,
-    c: r[13] ? new Date(r[13]).getTime() : 0
-  }));
-  idx.sort((a, b) => (b.d - a.d) || (b.c - a.c));
-
-  const picked = filter.limit ? idx.slice(0, Number(filter.limit)) : idx;
-  return picked.map(o => rowToTx_(rows[o.i]));
-}
-
-function getDashboard() {
-  const rows = getTransactionRows_();
-  const now = new Date();
-  const y = now.getFullYear();
-  const m = now.getMonth();
-
-  let revenue = 0;
-  let expenses = 0;
-  const byBusiness = {};
-  BUSINESS_TYPES.forEach(k => byBusiness[k] = { revenue: 0, expense: 0, profit: 0, margin: 0 });
-
-  rows.forEach(r => {
-    const d = new Date(r[1]);
-    if (d.getFullYear() !== y || d.getMonth() !== m) return;
-    const type = r[2], biz = r[3] || '工作室共用', amount = Number(r[8] || 0);
-    if (!byBusiness[biz]) byBusiness[biz] = { revenue: 0, expense: 0, profit: 0, margin: 0 };
-    if (type === '收入') { revenue += amount; byBusiness[biz].revenue += amount; }
-    if (type === '支出') { expenses += amount; byBusiness[biz].expense += amount; }
-  });
-
-  Object.keys(byBusiness).forEach(k => {
-    const b = byBusiness[k];
-    b.profit = b.revenue - b.expense;
-    b.margin = b.revenue > 0 ? (b.profit / b.revenue) * 100 : 0;
-  });
-
-  const fixedCosts = getFixedCosts_().reduce((s, x) => s + x.amount, 0);
-  const settings = getSettingsMap_();
-  const ownerSalary = Number(settings.OWNER_SALARY_TARGET || 0);
-  const cashBalance = Number(settings.CASH_BALANCE || 0);
-
-  // 固定成本由 FixedCosts 統一管理；記帳頁的支出用於專案/變動成本，避免固定成本重複計算。
-  const netProfit = revenue - expenses - fixedCosts;
-  const monthlyBurn = Math.max(fixedCosts + ownerSalary, 1);
-  const runway = cashBalance / monthlyBurn;
-  const safeMonths = Number(settings.SAFE_MONTHS || 6);
-  const lowMonths = Number(settings.LOW_MONTHS || 3);
-  let health = '紅燈';
-  if (runway >= safeMonths && netProfit >= 0) health = '綠燈';
-  else if (runway >= lowMonths) health = '黃燈';
-
-  const totalBusinessRevenue = Object.values(byBusiness).reduce((s, b) => s + b.revenue, 0);
-  const totalBusinessExpense = Object.values(byBusiness).reduce((s, b) => s + b.expense, 0);
-  const avgMargin = totalBusinessRevenue > 0 ? (totalBusinessRevenue - totalBusinessExpense) / totalBusinessRevenue : 0;
-  const breakevenRevenue = avgMargin > 0 ? (fixedCosts + ownerSalary) / avgMargin : 0;
-
-  return {
-    month: Utilities.formatDate(now, getTz_(), 'yyyy-MM'),
-    revenue, expenses, netProfit, fixedCosts, ownerSalary, cashBalance,
-    runwayMonths: runway,
-    health,
-    breakevenRevenue,
-    avgMargin: avgMargin * 100,
-    byBusiness
-  };
-}
-
-/* ===================================================================
- * 寫入
- * =================================================================== */
-function addTransaction(data) {
-  validateTransaction_(data);
-  const sh = getSheet_(CONFIG.SHEETS.TRANSACTIONS);
-  const id = 'TX-' + Utilities.getUuid().slice(0, 8).toUpperCase();
-  const row = [
-    id,
-    parseDate_(data.date),
-    data.type,
-    data.businessType,
-    data.category,
-    data.projectId || '',
-    data.customer || '',
-    data.description || '',
-    Number(data.amount),
-    data.paymentMethod || '',
-    data.account || '',
-    data.paymentStatus || '已收/付',
-    data.note || '',
-    new Date()
-  ];
-  sh.appendRow(row);
-
-  // 直接把新資料塞進這次請求的快取，儀表板與帳本就不用再讀一次整張表。
-  if (TX_ROWS_) TX_ROWS_.push(row);
-  else TX_ROWS_ = getRows_(sh);
-
-  return { ok: true, id: id, dashboard: getDashboard(), recentTransactions: getTransactions({ limit: 30 }) };
-}
-
-function validateTransaction_(d) {
+function cleanTx(d) {
   if (!d) throw new Error('缺少資料');
-  ['date', 'type', 'businessType', 'category', 'amount'].forEach(k => {
-    if (d[k] === undefined || d[k] === null || d[k] === '') throw new Error('欄位不可空白：' + k);
+  const date = toYMD(d.date);
+  if (!date) throw new Error('日期格式錯誤');
+  if (d.type !== '收入' && d.type !== '支出') throw new Error('收支類型錯誤');
+  const amount = Math.round((parseFloat(d.amount) || 0) * 100) / 100;
+  if (!(amount > 0)) throw new Error('金額必須大於 0');
+  return {
+    date: date,
+    type: d.type,
+    businessType: normBiz(d.businessType) || SHARED_BIZ,
+    category: str(d.category) || '其他',
+    customer: d.customer,
+    description: d.description,
+    amount: amount,
+    account: d.account,
+    paymentMethod: d.paymentMethod,
+    paymentStatus: d.paymentStatus === UNPAID ? UNPAID : PAID,
+    projectId: d.projectId,
+    note: d.note
+  };
+}
+
+// 第 2～13 欄（日期～備註）
+function txCells(t) {
+  return [
+    t.date, t.type, t.businessType, safeText(t.category),
+    safeText(t.customer), safeText(t.description), t.amount,
+    safeText(t.account), safeText(t.paymentMethod), t.paymentStatus,
+    safeText(t.projectId), safeText(t.note)
+  ];
+}
+
+function addTransaction(data) {
+  const t = cleanTx(data);
+  const now = nowStr();
+  withLock(function () {
+    getTransactionSheet().appendRow([genId()].concat(txCells(t), [now, now]));
   });
-  if (!['收入', '支出'].includes(d.type)) throw new Error('收入/支出格式錯誤');
-  if (Number(d.amount) <= 0) throw new Error('金額必須大於 0');
+  return t;
+}
+
+function updateTransaction(data) {
+  if (!data || !data.id) throw new Error('缺少交易 ID');
+  const t = cleanTx(data);
+  withLock(function () {
+    const sheet = getTransactionSheet();
+    const row = findRowById(sheet, data.id);
+    if (row < 2) throw new Error('找不到這筆交易，可能已被刪除');
+    sheet.getRange(row, COL.DATE, 1, 12).setValues([txCells(t)]);
+    sheet.getRange(row, COL.UPDATED).setValue(nowStr());
+  });
+  return t;
+}
+
+function deleteTransaction(id) {
+  if (!id) throw new Error('缺少交易 ID');
+  withLock(function () {
+    const sheet = getTransactionSheet();
+    const row = findRowById(sheet, id);
+    if (row >= 2) sheet.deleteRow(row);
+  });
+}
+
+function setPaymentStatus(data) {
+  if (!data || !data.id) throw new Error('缺少交易 ID');
+  const status = data.status === UNPAID ? UNPAID : PAID;
+  withLock(function () {
+    const sheet = getTransactionSheet();
+    const row = findRowById(sheet, data.id);
+    if (row < 2) throw new Error('找不到這筆交易，可能已被刪除');
+    sheet.getRange(row, COL.STATUS).setValue(status);
+    sheet.getRange(row, COL.UPDATED).setValue(nowStr());
+  });
+}
+
+// ===== 設定 =====
+function getSettings() {
+  const sheet = getSettingsSheet();
+  const lastRow = sheet.getLastRow();
+  const result = { CASH_BALANCE: 0, OWNER_SALARY_TARGET: 0 };
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, 2).getValues().forEach(function (r) {
+      if (r[0] in result) result[r[0]] = parseFloat(r[1]) || 0;
+    });
+  }
+  return result;
 }
 
 function saveSettings(data) {
-  const sh = getSheet_(CONFIG.SHEETS.SETTINGS);
-  const rows = getRows_(sh);
-  const keyToRow = {};
-  rows.forEach((r, i) => keyToRow[r[0]] = i + 2);
-  Object.keys(data || {}).forEach(key => {
-    if (keyToRow[key]) sh.getRange(keyToRow[key], 2).setValue(data[key]);
-    else sh.appendRow([key, data[key], '']);
+  if (!data) throw new Error('缺少資料');
+  withLock(function () {
+    const sheet = getSettingsSheet();
+    const lastRow = sheet.getLastRow();
+    const keys = lastRow > 1 ? sheet.getRange(2, 1, lastRow - 1, 1).getValues().map(function (r) { return r[0]; }) : [];
+    ['CASH_BALANCE', 'OWNER_SALARY_TARGET'].forEach(function (key) {
+      if (!(key in data)) return;
+      const val = parseFloat(data[key]) || 0;
+      const i = keys.indexOf(key);
+      if (i >= 0) sheet.getRange(i + 2, 2).setValue(val);
+      else { sheet.appendRow([key, val]); keys.push(key); }
+    });
   });
-  cacheClear_();
-  return { ok: true, dashboard: getDashboard() };
+}
+
+// ===== 固定成本 =====
+function getFixedCostList() {
+  const sheet = getFixedCostSheet();
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return [];
+  return sheet.getRange(2, 1, lastRow - 1, 3).getValues()
+    .map(function (r, i) { return { row: i + 2, item: str(r[0]), amount: parseFloat(r[1]) || 0, category: str(r[2]) || '其他' }; })
+    .filter(function (x) { return x.item; });
 }
 
 function addFixedCost(data) {
-  if (!data || !data.item || Number(data.amount) <= 0) throw new Error('固定成本資料不完整');
-  getSheet_(CONFIG.SHEETS.FIXED_COSTS)
-    .appendRow([data.item, Number(data.amount), data.category || '其他', true, data.note || '']);
-  cacheClear_();
-  return { ok: true, fixedCosts: getFixedCosts_(), dashboard: getDashboard() };
-}
-
-/* ===================================================================
- * 備份機制
- * =================================================================== */
-function getBackupFolder_() {
-  const it = DriveApp.getFoldersByName(CONFIG.BACKUP.FOLDER_NAME);
-  return it.hasNext() ? it.next() : DriveApp.createFolder(CONFIG.BACKUP.FOLDER_NAME);
-}
-
-/** 複製整份 Sheet 到 Drive 備份資料夾，並保留最近 N 份。 */
-function backupNow() {
-  const ss = getSpreadsheet_();
-  const folder = getBackupFolder_();
-  const stamp = Utilities.formatDate(new Date(), getTz_(), 'yyyy-MM-dd_HHmm');
-  const copy = DriveApp.getFileById(CONFIG.SPREADSHEET_ID)
-    .makeCopy('備份_' + stamp + '_' + ss.getName(), folder);
-  const removed = pruneBackups_(folder);
-  return {
-    ok: true,
-    name: copy.getName(),
-    url: copy.getUrl(),
-    folderUrl: folder.getUrl(),
-    removed: removed
-  };
-}
-
-/** 超過保留份數的舊備份移到垃圾桶（不是永久刪除，30 天內都救得回來）。 */
-function pruneBackups_(folder) {
-  const files = [];
-  const it = folder.getFiles();
-  while (it.hasNext()) {
-    const f = it.next();
-    files.push({ f: f, t: f.getDateCreated().getTime() });
-  }
-  files.sort((a, b) => b.t - a.t);
-  const old = files.slice(CONFIG.BACKUP.KEEP);
-  old.forEach(o => o.f.setTrashed(true));
-  return old.length;
-}
-
-function installBackupTrigger() {
-  removeBackupTrigger();
-  ScriptApp.newTrigger('backupNow')
-    .timeBased()
-    .atHour(CONFIG.BACKUP.HOUR)
-    .everyDays(1)
-    .create();
-  return { ok: true, message: '每日自動備份已啟用（約凌晨 ' + CONFIG.BACKUP.HOUR + ' 點）' };
-}
-
-function removeBackupTrigger() {
-  let n = 0;
-  ScriptApp.getProjectTriggers().forEach(t => {
-    if (t.getHandlerFunction() === 'backupNow') { ScriptApp.deleteTrigger(t); n++; }
+  if (!data || !str(data.item) || !(parseFloat(data.amount) > 0)) throw new Error('請填項目與金額');
+  withLock(function () {
+    getFixedCostSheet().appendRow([safeText(data.item), parseFloat(data.amount), safeText(data.category) || '其他']);
   });
-  return { ok: true, removed: n };
 }
 
-function getBackupStatus() {
-  const enabled = ScriptApp.getProjectTriggers()
-    .some(t => t.getHandlerFunction() === 'backupNow');
+function deleteFixedCost(data) {
+  if (!data || !data.row) throw new Error('缺少資料');
+  withLock(function () {
+    const sheet = getFixedCostSheet();
+    const row = parseInt(data.row, 10);
+    if (row < 2 || row > sheet.getLastRow()) throw new Error('找不到這筆固定成本');
+    // 確認該列的項目名稱一致，避免清單已變動時刪錯
+    if (str(sheet.getRange(row, 1).getValue()) !== str(data.item)) throw new Error('資料已變動，請重新整理後再試');
+    sheet.deleteRow(row);
+  });
+}
 
-  const folder = getBackupFolder_();
-  let count = 0;
-  let latest = null;
-  const it = folder.getFiles();
-  while (it.hasNext()) {
-    const f = it.next();
-    count++;
-    const t = f.getDateCreated();
-    if (!latest || t.getTime() > latest.getTime()) latest = t;
-  }
-  return {
-    enabled: enabled,
-    count: count,
-    keep: CONFIG.BACKUP.KEEP,
-    latest: latest ? Utilities.formatDate(latest, getTz_(), 'yyyy-MM-dd HH:mm') : '',
-    folderUrl: folder.getUrl()
+// ===== 主要彙總：儀表板 + 帳本 + 趨勢 + 應收應付 =====
+function getBootstrapData(month) {
+  const target = /^\d{4}-\d{2}$/.test(month || '') ? month : Utilities.formatDate(new Date(), tz(), 'yyyy-MM');
+  const all = readTransactions();
+
+  const byMonth = {};
+  all.forEach(function (t) {
+    const m = t.date.substring(0, 7);
+    (byMonth[m] = byMonth[m] || []).push(t);
+  });
+  const txOf = function (m) { return byMonth[m] || []; };
+  const inStudio = function (t) { return INCLUDE_PERSONAL_IN_STUDIO || t.businessType !== PERSONAL_BIZ; };
+  const sumStudio = function (list) {
+    let r = 0, x = 0;
+    list.forEach(function (t) {
+      if (!inStudio(t)) return;
+      if (t.type === '收入') r += t.amount; else x += t.amount;
+    });
+    return { revenue: r, expense: x };
   };
-}
 
-/* ===================================================================
- * CSV 匯出
- * =================================================================== */
-function csvCell_(v) {
-  const s = (v === null || v === undefined) ? '' : String(v);
-  return '"' + s.replace(/"/g, '""') + '"';
-}
+  const fixedCostList = getFixedCostList();
+  const fixedCosts = fixedCostList.reduce(function (s, x) { return s + x.amount; }, 0);
+  const settings = getSettings();
+  const cashBalance = settings.CASH_BALANCE;
+  const ownerSalary = settings.OWNER_SALARY_TARGET;
 
-function getExportFolder_() {
-  const parent = getBackupFolder_();
-  const it = parent.getFoldersByName(CONFIG.BACKUP.EXPORT_FOLDER_NAME);
-  return it.hasNext() ? it.next() : parent.createFolder(CONFIG.BACKUP.EXPORT_FOLDER_NAME);
-}
+  const monthTx = txOf(target);
+  const cur = sumStudio(monthTx);
+  const prevMonth = shiftMonth(target, -1);
+  const prev = sumStudio(txOf(prevMonth));
+  const prevHasData = txOf(prevMonth).length > 0;
 
-/**
- * 匯出 CSV 到 Drive 並回傳連結。
- * 不用瀏覽器直接下載，是因為 Apps Script 網頁被包在 iframe 沙箱裡，
- * 直接觸發下載常被擋；存到 Drive 再開連結最穩，而且等於多一份備份。
- */
-function exportTransactionsCsv(filter) {
-  const list = getTransactions(filter || {});
-  const lines = [TX_HEADERS.map(csvCell_).join(',')];
-  list.forEach(t => {
-    lines.push([
-      t.id, t.date, t.type, t.businessType, t.category, t.projectId, t.customer,
-      t.description, t.amount, t.paymentMethod, t.account, t.paymentStatus, t.note, t.createdAt
-    ].map(csvCell_).join(','));
+  const netProfit = cur.revenue - cur.expense - fixedCosts;
+  const breakevenRevenue = cur.expense + fixedCosts;
+
+  // 現金續航：用近 3 個月（有資料的月份）平均燒錢速度
+  const burns = [];
+  for (let i = 0; i < 3; i++) {
+    const m = shiftMonth(target, -i);
+    if (!txOf(m).length) continue;
+    const s = sumStudio(txOf(m));
+    burns.push(s.expense + fixedCosts - s.revenue);
+  }
+  const avgBurn = burns.length ? burns.reduce(function (a, b) { return a + b; }, 0) / burns.length : fixedCosts;
+  let runwayMonths = null; // null = 沒有在燒錢
+  if (avgBurn > 0) runwayMonths = cashBalance > 0 ? Math.round(cashBalance / avgBurn * 10) / 10 : 0;
+
+  let health, healthReason;
+  if (netProfit >= 0 && (runwayMonths === null || runwayMonths >= 3)) {
+    health = '綠燈'; healthReason = '本月獲利，現金續航充足';
+  } else if (runwayMonths === null || runwayMonths >= 1) {
+    health = '黃燈'; healthReason = netProfit < 0 ? '本月還沒達到損益兩平' : '現金續航少於 3 個月';
+  } else {
+    health = '紅燈'; healthReason = cashBalance <= 0 ? '尚未設定現金餘額，或現金已不足' : '現金續航少於 1 個月';
+  }
+
+  // 各業務
+  const byBusiness = {};
+  BUSINESS_TYPES.forEach(function (b) { byBusiness[b] = { revenue: 0, expense: 0, profit: 0, margin: 0, count: 0 }; });
+  const expenseByCat = {};
+  monthTx.forEach(function (t) {
+    const b = byBusiness[t.businessType] || (byBusiness[t.businessType] = { revenue: 0, expense: 0, profit: 0, margin: 0, count: 0 });
+    b.count++;
+    if (t.type === '收入') b.revenue += t.amount;
+    else {
+      b.expense += t.amount;
+      if (inStudio(t)) expenseByCat[t.category] = (expenseByCat[t.category] || 0) + t.amount;
+    }
+  });
+  Object.keys(byBusiness).forEach(function (k) {
+    const x = byBusiness[k];
+    x.profit = x.revenue - x.expense;
+    x.margin = x.revenue > 0 ? x.profit / x.revenue * 100 : 0;
+  });
+  const topExpenses = Object.keys(expenseByCat)
+    .map(function (k) { return { name: k, amount: expenseByCat[k] }; })
+    .sort(function (a, b) { return b.amount - a.amount; })
+    .slice(0, 6);
+
+  // 應收應付（跨所有月份，只要還沒結清）
+  const todayMs = new Date(toYMD(new Date()) + 'T00:00:00').getTime();
+  const unsettled = all.filter(function (t) { return t.paymentStatus === UNPAID; });
+  const receivable = unsettled.filter(function (t) { return t.type === '收入'; }).reduce(function (s, x) { return s + x.amount; }, 0);
+  const payable = unsettled.filter(function (t) { return t.type === '支出'; }).reduce(function (s, x) { return s + x.amount; }, 0);
+  const outstandingItems = unsettled
+    .slice()
+    .sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : 0; })
+    .slice(0, 100)
+    .map(function (t) {
+      const o = Object.assign({}, t);
+      o.ageDays = Math.max(0, Math.round((todayMs - new Date(t.date + 'T00:00:00').getTime()) / 86400000));
+      return o;
+    });
+
+  // 近 6 個月趨勢
+  const trend = [];
+  for (let i = 5; i >= 0; i--) {
+    const m = shiftMonth(target, -i);
+    const s = sumStudio(txOf(m));
+    trend.push({ month: m, revenue: s.revenue, expense: s.expense });
+  }
+
+  // 客戶清單（依最近交易排序，給自動完成用）
+  const customerSeen = {};
+  const customers = [];
+  all.slice().sort(function (a, b) { return a.date < b.date ? 1 : -1; }).forEach(function (t) {
+    if (t.customer && !customerSeen[t.customer] && customers.length < 80) {
+      customerSeen[t.customer] = true;
+      customers.push(t.customer);
+    }
   });
 
-  const filename = '帳本_' + Utilities.formatDate(new Date(), getTz_(), 'yyyyMMdd_HHmm') + '.csv';
-  // 開頭加 BOM，Excel 打開中文才不會變亂碼
-  const blob = Utilities.newBlob('\ufeff' + lines.join('\r\n'), 'text/csv', filename);
-  const file = getExportFolder_().createFile(blob);
+  const categories = [];
+  Object.keys(CATEGORIES).forEach(function (biz) {
+    ['收入', '支出'].forEach(function (type) {
+      (CATEGORIES[biz][type] || []).forEach(function (cat) {
+        categories.push({ name: cat, type: type, businessType: biz });
+      });
+    });
+  });
+
+  const transactions = monthTx.slice().sort(function (a, b) {
+    if (a.date !== b.date) return a.date < b.date ? 1 : -1;
+    return a.createdAt < b.createdAt ? 1 : -1;
+  });
 
   return {
-    ok: true,
-    rows: list.length,
-    filename: filename,
-    url: file.getUrl(),
-    downloadUrl: 'https://drive.google.com/uc?export=download&id=' + file.getId()
+    month: target,
+    dashboard: {
+      month: target,
+      revenue: cur.revenue,
+      expenses: cur.expense,
+      netProfit: netProfit,
+      fixedCosts: fixedCosts,
+      prev: { month: prevMonth, hasData: prevHasData, revenue: prev.revenue, expenses: prev.expense, netProfit: prev.revenue - prev.expense - fixedCosts },
+      cashBalance: cashBalance,
+      ownerSalary: ownerSalary,
+      breakevenRevenue: breakevenRevenue,
+      breakevenWithSalary: breakevenRevenue + ownerSalary,
+      avgBurn: avgBurn,
+      runwayMonths: runwayMonths,
+      health: health,
+      healthReason: healthReason,
+      byBusiness: byBusiness,
+      topExpenses: topExpenses
+    },
+    transactions: transactions,
+    trend: trend,
+    outstanding: { receivable: receivable, payable: payable, count: unsettled.length, items: outstandingItems },
+    fixedCosts: fixedCostList,
+    businessTypes: BUSINESS_TYPES,
+    categories: categories,
+    accounts: ACCOUNTS,
+    customers: customers,
+    meta: { version: APP_VERSION, includePersonal: INCLUDE_PERSONAL_IN_STUDIO, personalBiz: PERSONAL_BIZ, sharedBiz: SHARED_BIZ }
   };
 }
 
-/* ===================================================================
- * 工具
- * =================================================================== */
-function parseDate_(s) {
-  const parts = String(s).split('-').map(Number);
-  return new Date(parts[0], parts[1] - 1, parts[2]);
+// ===== v4 升級工具（在 Apps Script 編輯器手動執行一次）=====
+// 把「交易紀錄」裡的 迪特軍EV／電動車 等舊名稱直接改寫成「電車男電能車」
+// 不執行也能用（讀取時會自動轉換），但執行後試算表本身也會是新名稱，比較乾淨
+function upgradeToV4() {
+  const sheet = getTransactionSheet();
+  getSettingsSheet();
+  getFixedCostSheet();
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) { Logger.log('交易紀錄是空的，不需要改名。'); return; }
+  const range = sheet.getRange(2, COL.BIZ, lastRow - 1, 1);
+  const values = range.getValues();
+  let changed = 0;
+  values.forEach(function (r) {
+    const n = normBiz(r[0]);
+    if (n !== r[0]) { r[0] = n; changed++; }
+  });
+  if (changed) range.setValues(values);
+  Logger.log('升級完成：共把 ' + changed + ' 筆業務類型改成新名稱。');
 }
 
-function formatDate_(d) {
-  if (!d) return '';
-  return Utilities.formatDate(new Date(d), getTz_(), 'yyyy-MM-dd');
-}
+// ===== 一次性搬移工具：把舊的四個分頁資料搬進「交易紀錄」總表 =====
+// 已經在 v3 搬過的話不用再跑（有防重複機制，第二次執行會直接跳過）
+function migrateOldLedgersToTransactions() {
+  const props = PropertiesService.getScriptProperties();
+  if (props.getProperty('OLD_LEDGERS_MIGRATED')) {
+    Logger.log('之前已經搬移過，這次略過。若確定要重搬，先刪除 Script Properties 的 OLD_LEDGERS_MIGRATED。');
+    return;
+  }
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const newSheet = getTransactionSheet();
+  const rows = [];
 
-function formatDateTime_(d) {
-  if (!d) return '';
-  return Utilities.formatDate(new Date(d), getTz_(), 'yyyy-MM-dd HH:mm:ss');
-}
+  OLD_LEDGER_NAMES.forEach(function (name) {
+    const sheet = ss.getSheetByName(name);
+    if (!sheet || sheet.getLastRow() <= 1) return;
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, 8).getValues().forEach(function (row) {
+      const type = row[1];
+      if (type !== '收入' && type !== '支出') return;
+      const dateVal = toYMD(row[0]);
+      if (!dateVal) return;
+      const createdAt = toStamp(row[7]) || dateVal;
+      const paymentMethod = str(row[5]);
+      rows.push([
+        'M' + Utilities.getUuid().substring(0, 8), dateVal, type, normBiz(name), safeText(row[2]),
+        '', safeText(row[4]), parseFloat(row[3]) || 0,
+        paymentMethod || '現金', paymentMethod, PAID, '', safeText(row[6]), createdAt, createdAt
+      ]);
+    });
+  });
 
-function asBool_(v) {
-  return v === true || String(v).toLowerCase() === 'true' || String(v) === '1';
+  if (rows.length) {
+    newSheet.getRange(newSheet.getLastRow() + 1, 1, rows.length, TRANSACTION_HEADER.length).setValues(rows);
+  }
+  props.setProperty('OLD_LEDGERS_MIGRATED', nowStr());
+  Logger.log('搬移完成，共搬移 ' + rows.length + ' 筆資料到「' + TRANSACTION_SHEET + '」分頁。');
 }
